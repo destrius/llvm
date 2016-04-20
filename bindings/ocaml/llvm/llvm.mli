@@ -852,6 +852,14 @@ val mdnull : llcontext -> llvalue
     See the method [llvm::MDString::getString] *)
 val get_mdstring : llvalue -> string option
 
+(** [get_mdnode_count v] returns the number of operands in the MDNode.
+    See the method [llvm::MDNode::getNumOperands] *)
+val get_mdnode_count : llvalue -> int
+
+(** [get_mdnode_operands v] returns the operands in the MDNode. *)
+(*     See the method [llvm::MDNode::getOperand] *)
+val get_mdnode_operands : llvalue -> llvalue array
+
 (** [get_named_metadata m name] returns all the MDNodes belonging to the named
     metadata (if any).
     See the method [llvm::NamedMDNode::getOperand]. *)
