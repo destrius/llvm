@@ -187,20 +187,15 @@ namespace {
                   cl::desc("Disable JIT lazy compilation"),
                   cl::init(false));
 
-  cl::opt<Reloc::Model>
-  RelocModel("relocation-model",
-             cl::desc("Choose relocation model"),
-             cl::init(Reloc::Default),
-             cl::values(
-            clEnumValN(Reloc::Default, "default",
-                       "Target default relocation model"),
-            clEnumValN(Reloc::Static, "static",
-                       "Non-relocatable code"),
-            clEnumValN(Reloc::PIC_, "pic",
-                       "Fully relocatable, position independent code"),
-            clEnumValN(Reloc::DynamicNoPIC, "dynamic-no-pic",
-                       "Relocatable external references, non-relocatable code"),
-            clEnumValEnd));
+  cl::opt<Reloc::Model> RelocModel(
+      "relocation-model", cl::desc("Choose relocation model"),
+      cl::values(
+          clEnumValN(Reloc::Static, "static", "Non-relocatable code"),
+          clEnumValN(Reloc::PIC_, "pic",
+                     "Fully relocatable, position independent code"),
+          clEnumValN(Reloc::DynamicNoPIC, "dynamic-no-pic",
+                     "Relocatable external references, non-relocatable code"),
+          clEnumValEnd));
 
   cl::opt<llvm::CodeModel::Model>
   CMModel("code-model",
@@ -235,6 +230,8 @@ namespace {
                      clEnumValN(FloatABI::Hard, "hard",
                                 "Hard float ABI (uses FP registers)"),
                      clEnumValEnd));
+
+  ExitOnError ExitOnErr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -257,7 +254,7 @@ public:
   ~LLIObjectCache() override {}
 
   void notifyObjectCompiled(const Module *M, MemoryBufferRef Obj) override {
-    const std::string ModuleID = M->getModuleIdentifier();
+    const std::string &ModuleID = M->getModuleIdentifier();
     std::string CacheName;
     if (!getCacheFilename(ModuleID, CacheName))
       return;
@@ -272,7 +269,7 @@ public:
   }
 
   std::unique_ptr<MemoryBuffer> getObject(const Module* M) override {
-    const std::string ModuleID = M->getModuleIdentifier();
+    const std::string &ModuleID = M->getModuleIdentifier();
     std::string CacheName;
     if (!getCacheFilename(ModuleID, CacheName))
       return nullptr;
@@ -368,10 +365,13 @@ CodeGenOpt::Level getOptLevel() {
 // main Driver function
 //
 int main(int argc, char **argv, char * const *envp) {
-  sys::PrintStackTraceOnErrorSignal();
+  sys::PrintStackTraceOnErrorSignal(argv[0]);
   PrettyStackTraceProgram X(argc, argv);
 
   atexit(llvm_shutdown); // Call llvm_shutdown() on exit.
+
+  if (argc > 1)
+    ExitOnErr.setBanner(std::string(argv[0]) + ": ");
 
   // If we have a native target, initialize it to ensure it is linked in and
   // usable by the JIT.
@@ -420,7 +420,8 @@ int main(int argc, char **argv, char * const *envp) {
   builder.setMArch(MArch);
   builder.setMCPU(MCPU);
   builder.setMAttrs(MAttrs);
-  builder.setRelocationModel(RelocModel);
+  if (RelocModel.getNumOccurrences())
+    builder.setRelocationModel(RelocModel);
   builder.setCodeModel(CMModel);
   builder.setErrorStr(&ErrorMsg);
   builder.setEngineKind(ForceInterpreter
@@ -648,18 +649,11 @@ int main(int argc, char **argv, char * const *envp) {
 
     // Create a remote target client running over the channel.
     typedef orc::remote::OrcRemoteTargetClient<orc::remote::RPCChannel> MyRemote;
-    ErrorOr<MyRemote> R = MyRemote::Create(*C);
-    if (!R) {
-      errs() << "Could not create remote: " << R.getError().message() << "\n";
-      exit(1);
-    }
+    MyRemote R = ExitOnErr(MyRemote::Create(*C));
 
     // Create a remote memory manager.
     std::unique_ptr<MyRemote::RCMemoryManager> RemoteMM;
-    if (auto EC = R->createRemoteMemoryManager(RemoteMM)) {
-      errs() << "Could not create remote memory manager: " << EC.message() << "\n";
-      exit(1);
-    }
+    ExitOnErr(R.createRemoteMemoryManager(RemoteMM));
 
     // Forward MCJIT's memory manager calls to the remote memory manager.
     static_cast<ForwardingMemoryManager*>(RTDyldMM)->setMemMgr(
@@ -668,16 +662,12 @@ int main(int argc, char **argv, char * const *envp) {
     // Forward MCJIT's symbol resolution calls to the remote.
     static_cast<ForwardingMemoryManager*>(RTDyldMM)->setResolver(
       orc::createLambdaResolver(
+        [](const std::string &Name) { return nullptr; },
         [&](const std::string &Name) {
-          if (auto AddrOrErr = R->getSymbolAddress(Name))
-	    return RuntimeDyld::SymbolInfo(*AddrOrErr, JITSymbolFlags::Exported);
-	  else {
-	    errs() << "Failure during symbol lookup: "
-		   << AddrOrErr.getError().message() << "\n";
-	    exit(1);
-	  }
-        },
-        [](const std::string &Name) { return nullptr; }
+          if (auto Addr = ExitOnErr(R.getSymbolAddress(Name)))
+	    return RuntimeDyld::SymbolInfo(Addr, JITSymbolFlags::Exported);
+          return RuntimeDyld::SymbolInfo(nullptr);
+        }
       ));
 
     // Grab the target address of the JIT'd main function on the remote and call
@@ -687,10 +677,7 @@ int main(int argc, char **argv, char * const *envp) {
     EE->finalizeObject();
     DEBUG(dbgs() << "Executing '" << EntryFn->getName() << "' at 0x"
                  << format("%llx", Entry) << "\n");
-    if (auto ResultOrErr = R->callIntVoid(Entry))
-      Result = *ResultOrErr;
-    else
-      errs() << "ERROR: " << ResultOrErr.getError().message() << "\n";
+    Result = ExitOnErr(R.callIntVoid(Entry));
 
     // Like static constructors, the remote target MCJIT support doesn't handle
     // this yet. It could. FIXME.
@@ -701,7 +688,7 @@ int main(int argc, char **argv, char * const *envp) {
     EE.reset();
 
     // Signal the remote target that we're done JITing.
-    R->terminateSession();
+    ExitOnErr(R.terminateSession());
   }
 
   return Result;

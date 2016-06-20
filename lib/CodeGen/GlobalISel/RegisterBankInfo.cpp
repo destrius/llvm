@@ -35,30 +35,6 @@ using namespace llvm;
 const unsigned RegisterBankInfo::DefaultMappingID = UINT_MAX;
 const unsigned RegisterBankInfo::InvalidMappingID = UINT_MAX - 1;
 
-/// Get the size in bits of the \p Reg.
-///
-/// \pre \p Reg != 0 (NoRegister).
-static unsigned getSizeInBits(unsigned Reg, const MachineRegisterInfo &MRI,
-                              const TargetRegisterInfo &TRI) {
-  const TargetRegisterClass *RC = nullptr;
-  if (TargetRegisterInfo::isPhysicalRegister(Reg)) {
-    // The size is not directly available for physical registers.
-    // Instead, we need to access a register class that contains Reg and
-    // get the size of that register class.
-    RC = TRI.getMinimalPhysRegClass(Reg);
-  } else {
-    unsigned RegSize = MRI.getSize(Reg);
-    // If Reg is not a generic register, query the register class to
-    // get its size.
-    if (RegSize)
-      return RegSize;
-    // Since Reg is not a generic register, it must have a register class.
-    RC = MRI.getRegClass(Reg);
-  }
-  assert(RC && "Unable to deduce the register class");
-  return RC->getSize() * 8;
-}
-
 //------------------------------------------------------------------------------
 // RegisterBankInfo implementation.
 //------------------------------------------------------------------------------
@@ -67,14 +43,15 @@ RegisterBankInfo::RegisterBankInfo(unsigned NumRegBanks)
   RegBanks.reset(new RegisterBank[NumRegBanks]);
 }
 
-void RegisterBankInfo::verify(const TargetRegisterInfo &TRI) const {
-  for (unsigned Idx = 0, End = getNumRegBanks(); Idx != End; ++Idx) {
+bool RegisterBankInfo::verify(const TargetRegisterInfo &TRI) const {
+  DEBUG(for (unsigned Idx = 0, End = getNumRegBanks(); Idx != End; ++Idx) {
     const RegisterBank &RegBank = getRegBank(Idx);
     assert(Idx == RegBank.getID() &&
            "ID does not match the index in the array");
-    DEBUG(dbgs() << "Verify " << RegBank << '\n');
-    RegBank.verify(TRI);
-  }
+    dbgs() << "Verify " << RegBank << '\n';
+    assert(RegBank.verify(TRI) && "RegBank is invalid");
+  });
+  return true;
 }
 
 void RegisterBankInfo::createRegisterBank(unsigned ID, const char *Name) {
@@ -344,7 +321,7 @@ RegisterBankInfo::getInstrPossibleMappings(const MachineInstr &MI) const {
     PossibleMappings.emplace_back(std::move(AltMapping));
 #ifndef NDEBUG
   for (const InstructionMapping &Mapping : PossibleMappings)
-    Mapping.verify(MI);
+    assert(Mapping.verify(MI) && "Mapping is invalid");
 #endif
   return PossibleMappings;
 }
@@ -355,6 +332,55 @@ RegisterBankInfo::getInstrAlternativeMappings(const MachineInstr &MI) const {
   return InstructionMappings();
 }
 
+void RegisterBankInfo::applyDefaultMapping(const OperandsMapper &OpdMapper) {
+  MachineInstr &MI = OpdMapper.getMI();
+  DEBUG(dbgs() << "Applying default-like mapping\n");
+  for (unsigned OpIdx = 0, EndIdx = MI.getNumOperands(); OpIdx != EndIdx;
+       ++OpIdx) {
+    DEBUG(dbgs() << "OpIdx " << OpIdx);
+    MachineOperand &MO = MI.getOperand(OpIdx);
+    if (!MO.isReg()) {
+      DEBUG(dbgs() << " is not a register, nothing to be done\n");
+      continue;
+    }
+    assert(
+        OpdMapper.getInstrMapping().getOperandMapping(OpIdx).BreakDown.size() ==
+            1 &&
+        "This mapping is too complex for this function");
+    iterator_range<SmallVectorImpl<unsigned>::const_iterator> NewRegs =
+        OpdMapper.getVRegs(OpIdx);
+    if (NewRegs.begin() == NewRegs.end()) {
+      DEBUG(dbgs() << " has not been repaired, nothing to be done\n");
+      continue;
+    }
+    DEBUG(dbgs() << " changed, replace " << MO.getReg());
+    MO.setReg(*NewRegs.begin());
+    DEBUG(dbgs() << " with " << MO.getReg());
+  }
+}
+
+unsigned RegisterBankInfo::getSizeInBits(unsigned Reg,
+                                         const MachineRegisterInfo &MRI,
+                                         const TargetRegisterInfo &TRI) {
+  const TargetRegisterClass *RC = nullptr;
+  if (TargetRegisterInfo::isPhysicalRegister(Reg)) {
+    // The size is not directly available for physical registers.
+    // Instead, we need to access a register class that contains Reg and
+    // get the size of that register class.
+    RC = TRI.getMinimalPhysRegClass(Reg);
+  } else {
+    unsigned RegSize = MRI.getSize(Reg);
+    // If Reg is not a generic register, query the register class to
+    // get its size.
+    if (RegSize)
+      return RegSize;
+    // Since Reg is not a generic register, it must have a register class.
+    RC = MRI.getRegClass(Reg);
+  }
+  assert(RC && "Unable to deduce the register class");
+  return RC->getSize() * 8;
+}
+
 //------------------------------------------------------------------------------
 // Helper classes implementation.
 //------------------------------------------------------------------------------
@@ -363,51 +389,49 @@ void RegisterBankInfo::PartialMapping::dump() const {
   dbgs() << '\n';
 }
 
-void RegisterBankInfo::PartialMapping::verify() const {
+bool RegisterBankInfo::PartialMapping::verify() const {
   assert(RegBank && "Register bank not set");
-  // Check what is the minimum width that will live into RegBank.
-  // RegBank will have to, at least, accomodate all the bits between the first
-  // and last bits active in Mask.
-  // If Mask is zero, then ActiveWidth is 0.
-  unsigned ActiveWidth = 0;
-  // Otherwise, remove the trailing and leading zeros from the bitwidth.
-  // 0..0 ActiveWidth 0..0.
-  if (Mask.getBoolValue())
-    ActiveWidth = Mask.getBitWidth() - Mask.countLeadingZeros() -
-                  Mask.countTrailingZeros();
-  (void)ActiveWidth;
-  assert(ActiveWidth <= Mask.getBitWidth() &&
-         "Wrong computation of ActiveWidth, overflow?");
-  assert(RegBank->getSize() >= ActiveWidth &&
-         "Register bank too small for Mask");
+  assert(Length && "Empty mapping");
+  assert((StartIdx < getHighBitIdx()) && "Overflow, switch to APInt?");
+  // Check if the minimum width fits into RegBank.
+  assert(RegBank->getSize() >= Length && "Register bank too small for Mask");
+  return true;
 }
 
 void RegisterBankInfo::PartialMapping::print(raw_ostream &OS) const {
-  SmallString<128> MaskStr;
-  Mask.toString(MaskStr, /*Radix*/ 16, /*Signed*/ 0, /*formatAsCLiteral*/ true);
-  OS << "Mask(" << Mask.getBitWidth() << ") = " << MaskStr << ", RegBank = ";
+  OS << "[" << StartIdx << ", " << getHighBitIdx() << "], RegBank = ";
   if (RegBank)
     OS << *RegBank;
   else
     OS << "nullptr";
 }
 
-void RegisterBankInfo::ValueMapping::verify(unsigned ExpectedBitWidth) const {
+bool RegisterBankInfo::ValueMapping::verify(unsigned ExpectedBitWidth) const {
   assert(!BreakDown.empty() && "Value mapped nowhere?!");
-  unsigned ValueBitWidth = BreakDown.back().Mask.getBitWidth();
-  assert(ValueBitWidth == ExpectedBitWidth && "BitWidth does not match");
-  APInt ValueMask(ValueBitWidth, 0);
+  unsigned OrigValueBitWidth = 0;
   for (const RegisterBankInfo::PartialMapping &PartMap : BreakDown) {
-    // Check that all the partial mapping have the same bitwidth.
-    assert(PartMap.Mask.getBitWidth() == ValueBitWidth &&
-           "Value does not have the same size accross the partial mappings");
-    // Check that the union of the partial mappings covers the whole value.
-    ValueMask |= PartMap.Mask;
     // Check that each register bank is big enough to hold the partial value:
     // this check is done by PartialMapping::verify
-    PartMap.verify();
+    assert(PartMap.verify() && "Partial mapping is invalid");
+    // The original value should completely be mapped.
+    // Thus the maximum accessed index + 1 is the size of the original value.
+    OrigValueBitWidth =
+        std::max(OrigValueBitWidth, PartMap.getHighBitIdx() + 1);
+  }
+  assert(OrigValueBitWidth == ExpectedBitWidth && "BitWidth does not match");
+  APInt ValueMask(OrigValueBitWidth, 0);
+  for (const RegisterBankInfo::PartialMapping &PartMap : BreakDown) {
+    // Check that the union of the partial mappings covers the whole value,
+    // without overlaps.
+    // The high bit is exclusive in the APInt API, thus getHighBitIdx + 1.
+    APInt PartMapMask = APInt::getBitsSet(OrigValueBitWidth, PartMap.StartIdx,
+                                          PartMap.getHighBitIdx() + 1);
+    ValueMask ^= PartMapMask;
+    assert((ValueMask & PartMapMask) == PartMapMask &&
+           "Some partial mappings overlap");
   }
   assert(ValueMask.isAllOnesValue() && "Value is not fully mapped");
+  return true;
 }
 
 void RegisterBankInfo::ValueMapping::dump() const {
@@ -430,15 +454,13 @@ void RegisterBankInfo::InstructionMapping::setOperandMapping(
     unsigned OpIdx, unsigned MaskSize, const RegisterBank &RegBank) {
   // Build the value mapping.
   assert(MaskSize <= RegBank.getSize() && "Register bank is too small");
-  APInt Mask(MaskSize, 0);
-  // The value is represented by all the bits.
-  Mask.flipAllBits();
 
   // Create the mapping object.
-  getOperandMapping(OpIdx).BreakDown.push_back(PartialMapping(Mask, RegBank));
+  getOperandMapping(OpIdx).BreakDown.push_back(
+      PartialMapping(0, MaskSize, RegBank));
 }
 
-void RegisterBankInfo::InstructionMapping::verify(
+bool RegisterBankInfo::InstructionMapping::verify(
     const MachineInstr &MI) const {
   // Check that all the register operands are properly mapped.
   // Check the constructor invariant.
@@ -447,12 +469,12 @@ void RegisterBankInfo::InstructionMapping::verify(
   assert(MI.getParent() && MI.getParent()->getParent() &&
          "MI must be connected to a MachineFunction");
   const MachineFunction &MF = *MI.getParent()->getParent();
-  const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
-  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  (void)MF;
 
   for (unsigned Idx = 0; Idx < NumOperands; ++Idx) {
     const MachineOperand &MO = MI.getOperand(Idx);
     const RegisterBankInfo::ValueMapping &MOMapping = getOperandMapping(Idx);
+    (void)MOMapping;
     if (!MO.isReg()) {
       assert(MOMapping.BreakDown.empty() &&
              "We should not care about non-reg mapping");
@@ -463,9 +485,11 @@ void RegisterBankInfo::InstructionMapping::verify(
       continue;
     // Register size in bits.
     // This size must match what the mapping expects.
-    unsigned RegSize = getSizeInBits(Reg, MRI, TRI);
-    MOMapping.verify(RegSize);
+    assert(MOMapping.verify(getSizeInBits(
+               Reg, MF.getRegInfo(), *MF.getSubtarget().getRegisterInfo())) &&
+           "Value mapping is invalid");
   }
+  return true;
 }
 
 void RegisterBankInfo::InstructionMapping::dump() const {
@@ -481,5 +505,159 @@ void RegisterBankInfo::InstructionMapping::print(raw_ostream &OS) const {
     if (OpIdx)
       OS << ", ";
     OS << "{ Idx: " << OpIdx << " Map: " << ValMapping << '}';
+  }
+}
+
+const int RegisterBankInfo::OperandsMapper::DontKnowIdx = -1;
+
+RegisterBankInfo::OperandsMapper::OperandsMapper(
+    MachineInstr &MI, const InstructionMapping &InstrMapping,
+    MachineRegisterInfo &MRI)
+    : MRI(MRI), MI(MI), InstrMapping(InstrMapping) {
+  unsigned NumOpds = MI.getNumOperands();
+  OpToNewVRegIdx.reset(new int[NumOpds]);
+  std::fill(&OpToNewVRegIdx[0], &OpToNewVRegIdx[NumOpds],
+            OperandsMapper::DontKnowIdx);
+  assert(InstrMapping.verify(MI) && "Invalid mapping for MI");
+}
+
+iterator_range<SmallVectorImpl<unsigned>::iterator>
+RegisterBankInfo::OperandsMapper::getVRegsMem(unsigned OpIdx) {
+  assert(OpIdx < getMI().getNumOperands() && "Out-of-bound access");
+  unsigned NumPartialVal =
+      getInstrMapping().getOperandMapping(OpIdx).BreakDown.size();
+  int StartIdx = OpToNewVRegIdx[OpIdx];
+
+  if (StartIdx == OperandsMapper::DontKnowIdx) {
+    // This is the first time we try to access OpIdx.
+    // Create the cells that will hold all the partial values at the
+    // end of the list of NewVReg.
+    StartIdx = NewVRegs.size();
+    OpToNewVRegIdx[OpIdx] = StartIdx;
+    for (unsigned i = 0; i < NumPartialVal; ++i)
+      NewVRegs.push_back(0);
+  }
+  SmallVectorImpl<unsigned>::iterator End =
+      getNewVRegsEnd(StartIdx, NumPartialVal);
+
+  return make_range(&NewVRegs[StartIdx], End);
+}
+
+SmallVectorImpl<unsigned>::const_iterator
+RegisterBankInfo::OperandsMapper::getNewVRegsEnd(unsigned StartIdx,
+                                                 unsigned NumVal) const {
+  return const_cast<OperandsMapper *>(this)->getNewVRegsEnd(StartIdx, NumVal);
+}
+SmallVectorImpl<unsigned>::iterator
+RegisterBankInfo::OperandsMapper::getNewVRegsEnd(unsigned StartIdx,
+                                                 unsigned NumVal) {
+  assert((NewVRegs.size() == StartIdx + NumVal ||
+          NewVRegs.size() > StartIdx + NumVal) &&
+         "NewVRegs too small to contain all the partial mapping");
+  return NewVRegs.size() <= StartIdx + NumVal ? NewVRegs.end()
+                                              : &NewVRegs[StartIdx + NumVal];
+}
+
+void RegisterBankInfo::OperandsMapper::createVRegs(unsigned OpIdx) {
+  assert(OpIdx < getMI().getNumOperands() && "Out-of-bound access");
+  iterator_range<SmallVectorImpl<unsigned>::iterator> NewVRegsForOpIdx =
+      getVRegsMem(OpIdx);
+  const SmallVectorImpl<PartialMapping> &PartMapList =
+      getInstrMapping().getOperandMapping(OpIdx).BreakDown;
+  SmallVectorImpl<PartialMapping>::const_iterator PartMap = PartMapList.begin();
+  for (unsigned &NewVReg : NewVRegsForOpIdx) {
+    assert(PartMap != PartMapList.end() && "Out-of-bound access");
+    assert(NewVReg == 0 && "Register has already been created");
+    NewVReg = MRI.createGenericVirtualRegister(PartMap->Length);
+    MRI.setRegBank(NewVReg, *PartMap->RegBank);
+    ++PartMap;
+  }
+}
+
+void RegisterBankInfo::OperandsMapper::setVRegs(unsigned OpIdx,
+                                                unsigned PartialMapIdx,
+                                                unsigned NewVReg) {
+  assert(OpIdx < getMI().getNumOperands() && "Out-of-bound access");
+  assert(getInstrMapping().getOperandMapping(OpIdx).BreakDown.size() >
+             PartialMapIdx &&
+         "Out-of-bound access for partial mapping");
+  // Make sure the memory is initialized for that operand.
+  (void)getVRegsMem(OpIdx);
+  assert(NewVRegs[OpToNewVRegIdx[OpIdx] + PartialMapIdx] == 0 &&
+         "This value is already set");
+  NewVRegs[OpToNewVRegIdx[OpIdx] + PartialMapIdx] = NewVReg;
+}
+
+iterator_range<SmallVectorImpl<unsigned>::const_iterator>
+RegisterBankInfo::OperandsMapper::getVRegs(unsigned OpIdx,
+                                           bool ForDebug) const {
+  (void)ForDebug;
+  assert(OpIdx < getMI().getNumOperands() && "Out-of-bound access");
+  int StartIdx = OpToNewVRegIdx[OpIdx];
+
+  if (StartIdx == OperandsMapper::DontKnowIdx)
+    return make_range(NewVRegs.end(), NewVRegs.end());
+
+  unsigned PartMapSize =
+      getInstrMapping().getOperandMapping(OpIdx).BreakDown.size();
+  SmallVectorImpl<unsigned>::const_iterator End =
+      getNewVRegsEnd(StartIdx, PartMapSize);
+  iterator_range<SmallVectorImpl<unsigned>::const_iterator> Res =
+      make_range(&NewVRegs[StartIdx], End);
+#ifndef NDEBUG
+  for (unsigned VReg : Res)
+    assert((VReg || ForDebug) && "Some registers are uninitialized");
+#endif
+  return Res;
+}
+
+void RegisterBankInfo::OperandsMapper::dump() const {
+  print(dbgs(), true);
+  dbgs() << '\n';
+}
+
+void RegisterBankInfo::OperandsMapper::print(raw_ostream &OS,
+                                             bool ForDebug) const {
+  unsigned NumOpds = getMI().getNumOperands();
+  if (ForDebug) {
+    OS << "Mapping for " << getMI() << "\nwith " << getInstrMapping() << '\n';
+    // Print out the internal state of the index table.
+    OS << "Populated indices (CellNumber, IndexInNewVRegs): ";
+    bool IsFirst = true;
+    for (unsigned Idx = 0; Idx != NumOpds; ++Idx) {
+      if (OpToNewVRegIdx[Idx] != DontKnowIdx) {
+        if (!IsFirst)
+          OS << ", ";
+        OS << '(' << Idx << ", " << OpToNewVRegIdx[Idx] << ')';
+        IsFirst = false;
+      }
+    }
+    OS << '\n';
+  } else
+    OS << "Mapping ID: " << getInstrMapping().getID() << ' ';
+
+  OS << "Operand Mapping: ";
+  // If we have a function, we can pretty print the name of the registers.
+  // Otherwise we will print the raw numbers.
+  const TargetRegisterInfo *TRI =
+      getMI().getParent() && getMI().getParent()->getParent()
+          ? getMI().getParent()->getParent()->getSubtarget().getRegisterInfo()
+          : nullptr;
+  bool IsFirst = true;
+  for (unsigned Idx = 0; Idx != NumOpds; ++Idx) {
+    if (OpToNewVRegIdx[Idx] == DontKnowIdx)
+      continue;
+    if (!IsFirst)
+      OS << ", ";
+    IsFirst = false;
+    OS << '(' << PrintReg(getMI().getOperand(Idx).getReg(), TRI) << ", [";
+    bool IsFirstNewVReg = true;
+    for (unsigned VReg : getVRegs(Idx)) {
+      if (!IsFirstNewVReg)
+        OS << ", ";
+      IsFirstNewVReg = false;
+      OS << PrintReg(VReg, TRI);
+    }
+    OS << "])";
   }
 }

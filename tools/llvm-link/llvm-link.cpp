@@ -36,6 +36,7 @@
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
 
 #include <memory>
+#include <utility>
 using namespace llvm;
 
 static cl::list<std::string>
@@ -146,7 +147,7 @@ public:
   ModuleLazyLoaderCache(std::function<std::unique_ptr<Module>(
                             const char *argv0, const std::string &FileName)>
                             createLazyModule)
-      : createLazyModule(createLazyModule) {}
+      : createLazyModule(std::move(createLazyModule)) {}
 
   /// Retrieve a Module from the cache or lazily load it on demand.
   Module &operator()(const char *argv0, const std::string &FileName);
@@ -276,8 +277,10 @@ static bool importFunctions(const char *argv0, LLVMContext &Context,
     if (renameModuleForThinLTO(*SrcModule, *Index, &GlobalsToImport))
       return true;
 
-    if (L.linkInModule(std::move(SrcModule), Linker::Flags::None,
-                       &GlobalsToImport))
+    // Instruct the linker to not automatically import linkonce defintion.
+    unsigned Flags = Linker::Flags::DontForceLinkLinkonceODR;
+
+    if (L.linkInModule(std::move(SrcModule), Flags, &GlobalsToImport))
       return false;
   }
 
@@ -332,7 +335,7 @@ static bool linkFiles(const char *argv0, LLVMContext &Context, Linker &L,
 
 int main(int argc, char **argv) {
   // Print a stack trace if we signal out.
-  sys::PrintStackTraceOnErrorSignal();
+  sys::PrintStackTraceOnErrorSignal(argv[0]);
   PrettyStackTraceProgram X(argc, argv);
 
   LLVMContext Context;

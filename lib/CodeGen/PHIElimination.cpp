@@ -120,6 +120,7 @@ INITIALIZE_PASS_END(PHIElimination, "phi-node-elimination",
                     "Eliminate PHI nodes for register allocation", false, false)
 
 void PHIElimination::getAnalysisUsage(AnalysisUsage &AU) const {
+  AU.addUsedIfAvailable<LiveVariables>();
   AU.addPreserved<LiveVariables>();
   AU.addPreserved<SlotIndexes>();
   AU.addPreserved<LiveIntervals>();
@@ -610,7 +611,7 @@ bool PHIElimination::SplitPHIEdges(MachineFunction &MF,
       }
       if (!ShouldSplit && !SplitAllCriticalEdges)
         continue;
-      if (!PreMBB->SplitCriticalEdge(&MBB, this)) {
+      if (!PreMBB->SplitCriticalEdge(&MBB, *this)) {
         DEBUG(dbgs() << "Failed to split critical edge.\n");
         continue;
       }

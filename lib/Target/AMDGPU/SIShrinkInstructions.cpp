@@ -31,10 +31,6 @@ STATISTIC(NumInstructionsShrunk,
 STATISTIC(NumLiteralConstantsFolded,
           "Number of literal constants folded into 32-bit instructions.");
 
-namespace llvm {
-  void initializeSIShrinkInstructionsPass(PassRegistry&);
-}
-
 using namespace llvm;
 
 namespace {
@@ -61,10 +57,8 @@ public:
 
 } // End anonymous namespace.
 
-INITIALIZE_PASS_BEGIN(SIShrinkInstructions, DEBUG_TYPE,
-                      "SI Lower il Copies", false, false)
-INITIALIZE_PASS_END(SIShrinkInstructions, DEBUG_TYPE,
-                    "SI Lower il Copies", false, false)
+INITIALIZE_PASS(SIShrinkInstructions, DEBUG_TYPE,
+                "SI Shrink Instructions", false, false)
 
 char SIShrinkInstructions::ID = 0;
 
@@ -203,6 +197,9 @@ static bool isKImmOperand(const SIInstrInfo *TII, const MachineOperand &Src) {
 }
 
 bool SIShrinkInstructions::runOnMachineFunction(MachineFunction &MF) {
+  if (skipFunction(*MF.getFunction()))
+    return false;
+
   MachineRegisterInfo &MRI = MF.getRegInfo();
   const SIInstrInfo *TII =
       static_cast<const SIInstrInfo *>(MF.getSubtarget().getInstrInfo());
@@ -240,6 +237,33 @@ bool SIShrinkInstructions::runOnMachineFunction(MachineFunction &MF) {
             }
           }
         }
+      }
+
+      // Combine adjacent s_nops to use the immediate operand encoding how long
+      // to wait.
+      //
+      // s_nop N
+      // s_nop M
+      //  =>
+      // s_nop (N + M)
+      if (MI.getOpcode() == AMDGPU::S_NOP &&
+          Next != MBB.end() &&
+          (*Next).getOpcode() == AMDGPU::S_NOP) {
+
+        MachineInstr &NextMI = *Next;
+        // The instruction encodes the amount to wait with an offset of 1,
+        // i.e. 0 is wait 1 cycle. Convert both to cycles and then convert back
+        // after adding.
+        uint8_t Nop0 = MI.getOperand(0).getImm() + 1;
+        uint8_t Nop1 = NextMI.getOperand(0).getImm() + 1;
+
+        // Make sure we don't overflow the bounds.
+        if (Nop0 + Nop1 <= 8) {
+          NextMI.getOperand(0).setImm(Nop0 + Nop1 - 1);
+          MI.eraseFromParent();
+        }
+
+        continue;
       }
 
       // FIXME: We also need to consider movs of constant operands since

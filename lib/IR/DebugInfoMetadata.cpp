@@ -45,7 +45,6 @@ DILocation *DILocation::getImpl(LLVMContext &Context, unsigned Line,
   // Fixup column.
   adjustColumn(Column);
 
-  assert(Scope && "Expected scope");
   if (Storage == Uniqued) {
     if (auto *N =
             getUniqued(Context.pImpl->DILocations,
@@ -86,8 +85,8 @@ const char *DINode::getFlagString(unsigned Flag) {
 
 unsigned DINode::splitFlags(unsigned Flags,
                             SmallVectorImpl<unsigned> &SplitFlags) {
-  // Accessibility flags need to be specially handled, since they're packed
-  // together.
+  // Accessibility and member pointer flags need to be specially handled, since
+  // they're packed together.
   if (unsigned A = Flags & FlagAccessibility) {
     if (A == FlagPrivate)
       SplitFlags.push_back(FlagPrivate);
@@ -96,6 +95,15 @@ unsigned DINode::splitFlags(unsigned Flags,
     else
       SplitFlags.push_back(FlagPublic);
     Flags &= ~A;
+  }
+  if (unsigned R = Flags & FlagPtrToMemberRep) {
+    if (R == FlagSingleInheritance)
+      SplitFlags.push_back(FlagSingleInheritance);
+    else if (R == FlagMultipleInheritance)
+      SplitFlags.push_back(FlagMultipleInheritance);
+    else
+      SplitFlags.push_back(FlagVirtualInheritance);
+    Flags &= ~R;
   }
 
 #define HANDLE_DI_FLAG(ID, NAME)                                               \
@@ -116,13 +124,13 @@ DIScopeRef DIScope::getScope() const {
     return SP->getScope();
 
   if (auto *LB = dyn_cast<DILexicalBlockBase>(this))
-    return DIScopeRef(LB->getScope());
+    return LB->getScope();
 
   if (auto *NS = dyn_cast<DINamespace>(this))
-    return DIScopeRef(NS->getScope());
+    return NS->getScope();
 
   if (auto *M = dyn_cast<DIModule>(this))
-    return DIScopeRef(M->getScope());
+    return M->getScope();
 
   assert((isa<DIFile>(this) || isa<DICompileUnit>(this)) &&
          "Unhandled type of scope.");
@@ -293,7 +301,7 @@ DICompositeType *DICompositeType::buildODRType(
              Flags);
   Metadata *Ops[] = {File,     Scope,        Name,           BaseType,
                      Elements, VTableHolder, TemplateParams, &Identifier};
-  assert(std::end(Ops) - std::begin(Ops) == CT->getNumOperands() &&
+  assert((std::end(Ops) - std::begin(Ops)) == (int)CT->getNumOperands() &&
          "Mismatched number of operands");
   for (unsigned I = 0, E = CT->getNumOperands(); I != E; ++I)
     if (Ops[I] != CT->getOperand(I))
@@ -328,12 +336,13 @@ DICompositeType *DICompositeType::getODRTypeIfExists(LLVMContext &Context,
 }
 
 DISubroutineType *DISubroutineType::getImpl(LLVMContext &Context,
-                                            unsigned Flags, Metadata *TypeArray,
+                                            unsigned Flags, uint8_t CC,
+                                            Metadata *TypeArray,
                                             StorageType Storage,
                                             bool ShouldCreate) {
-  DEFINE_GETIMPL_LOOKUP(DISubroutineType, (Flags, TypeArray));
+  DEFINE_GETIMPL_LOOKUP(DISubroutineType, (Flags, CC, TypeArray));
   Metadata *Ops[] = {nullptr, nullptr, nullptr, TypeArray};
-  DEFINE_GETIMPL_STORE(DISubroutineType, (Flags), Ops);
+  DEFINE_GETIMPL_STORE(DISubroutineType, (Flags, CC), Ops);
 }
 
 DIFile *DIFile::getImpl(LLVMContext &Context, MDString *Filename,
@@ -390,6 +399,12 @@ DISubprogram *DILocalScope::getSubprogram() const {
   if (auto *Block = dyn_cast<DILexicalBlockBase>(this))
     return Block->getScope()->getSubprogram();
   return const_cast<DISubprogram *>(cast<DISubprogram>(this));
+}
+
+DILocalScope *DILocalScope::getNonLexicalBlockFileScope() const {
+  if (auto *File = dyn_cast<DILexicalBlockFile>(this))
+    return File->getScope()->getNonLexicalBlockFileScope();
+  return const_cast<DILocalScope *>(this);
 }
 
 DISubprogram *DISubprogram::getImpl(

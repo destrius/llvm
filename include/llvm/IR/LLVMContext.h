@@ -29,9 +29,11 @@ class MDString;
 class DICompositeType;
 class SMDiagnostic;
 class DiagnosticInfo;
+enum DiagnosticSeverity : char;
 template <typename T> class SmallVectorImpl;
 class Function;
 class DebugLoc;
+class OptBisect;
 
 /// This is an important class for using LLVM in a threaded context.  It
 /// (opaquely) owns and manages the core "global" data of LLVM's core
@@ -171,6 +173,10 @@ public:
   /// setDiagnosticContext.
   void *getDiagnosticContext() const;
 
+  /// \brief Get the prefix that should be printed in front of a diagnostic of
+  ///        the given \p Severity
+  static const char *getDiagnosticMessagePrefix(DiagnosticSeverity Severity);
+
   /// \brief Report a message to the currently installed diagnostic handler.
   ///
   /// This function returns, in particular in the case of error reporting
@@ -226,6 +232,9 @@ public:
     return OptionRegistry::instance().template get<ValT, Base, Mem>();
   }
 
+  /// \brief Access the object which manages optimization bisection for failure
+  /// analysis.
+  OptBisect &getOptBisect();
 private:
   LLVMContext(LLVMContext&) = delete;
   void operator=(LLVMContext&) = delete;

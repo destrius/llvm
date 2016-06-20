@@ -14,6 +14,7 @@
 #include "llvm/Support/CachePruning.h"
 
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Errc.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -33,8 +34,15 @@ static void writeTimestampFile(StringRef TimestampFile) {
 
 /// Prune the cache of files that haven't been accessed in a long time.
 bool CachePruning::prune() {
-  SmallString<128> TimestampFile(Path);
-  sys::path::append(TimestampFile, "llvmcache.timestamp");
+  if (Path.empty())
+    return false;
+
+  bool isPathDir;
+  if (sys::fs::is_directory(Path, isPathDir))
+    return false;
+
+  if (!isPathDir)
+    return false;
 
   if (Expiration == 0 && PercentageOfAvailableSpace == 0) {
     DEBUG(dbgs() << "No pruning settings set, exit early\n");
@@ -43,10 +51,12 @@ bool CachePruning::prune() {
   }
 
   // Try to stat() the timestamp file.
+  SmallString<128> TimestampFile(Path);
+  sys::path::append(TimestampFile, "llvmcache.timestamp");
   sys::fs::file_status FileStatus;
   sys::TimeValue CurrentTime = sys::TimeValue::now();
-  if (sys::fs::status(TimestampFile, FileStatus)) {
-    if (errno == ENOENT) {
+  if (auto EC = sys::fs::status(TimestampFile, FileStatus)) {
+    if (EC == errc::no_such_file_or_directory) {
       // If the timestamp file wasn't there, create one now.
       writeTimestampFile(TimestampFile);
     } else {

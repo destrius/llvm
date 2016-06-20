@@ -54,11 +54,13 @@ static cl::opt<unsigned>
 
 void MachineFunctionInitializer::anchor() {}
 
-void MachineFunctionProperties::print(raw_ostream &ROS) const {
+void MachineFunctionProperties::print(raw_ostream &ROS, bool OnlySet) const {
   // Leave this function even in NDEBUG as an out-of-line anchor.
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
   for (BitVector::size_type i = 0; i < Properties.size(); ++i) {
     bool HasProperty = Properties[i];
+    if (OnlySet && !HasProperty)
+      continue;
     switch(static_cast<Property>(i)) {
       case Property::IsSSA:
         ROS << (HasProperty ? "SSA, " : "Post SSA, ");
@@ -245,9 +247,9 @@ void MachineFunction::RenumberBlocks(MachineBasicBlock *MBB) {
 }
 
 /// Allocate a new MachineInstr. Use this instead of `new MachineInstr'.
-MachineInstr *
-MachineFunction::CreateMachineInstr(const MCInstrDesc &MCID,
-                                    DebugLoc DL, bool NoImp) {
+MachineInstr *MachineFunction::CreateMachineInstr(const MCInstrDesc &MCID,
+                                                  const DebugLoc &DL,
+                                                  bool NoImp) {
   return new (InstructionRecycler.Allocate<MachineInstr>(Allocator))
     MachineInstr(*this, MCID, DL, NoImp);
 }
@@ -404,7 +406,7 @@ StringRef MachineFunction::getName() const {
   return getFunction()->getName();
 }
 
-void MachineFunction::print(raw_ostream &OS, SlotIndexes *Indexes) const {
+void MachineFunction::print(raw_ostream &OS, const SlotIndexes *Indexes) const {
   OS << "# Machine code for function " << getName() << ": ";
   OS << "Properties: <";
   getProperties().print(OS);

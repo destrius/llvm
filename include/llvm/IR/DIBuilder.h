@@ -51,7 +51,11 @@ namespace llvm {
     bool AllowUnresolvedNodes;
 
     /// Each subprogram's preserved local variables.
-    DenseMap<MDNode *, std::vector<TrackingMDNodeRef>> PreservedVariables;
+    ///
+    /// Do not use a std::vector.  Some versions of libc++ apparently copy
+    /// instead of move on grow operations, and TrackingMDRef is expensive to
+    /// copy.
+    DenseMap<MDNode *, SmallVector<TrackingMDNodeRef, 1>> PreservedVariables;
 
     DIBuilder(const DIBuilder &) = delete;
     void operator=(const DIBuilder &) = delete;
@@ -143,7 +147,8 @@ namespace llvm {
     /// \param Class Type for which this pointer points to members of.
     DIDerivedType *createMemberPointerType(DIType *PointeeTy, DIType *Class,
                                            uint64_t SizeInBits,
-                                           uint64_t AlignInBits = 0);
+                                           uint64_t AlignInBits = 0,
+                                           unsigned Flags = 0);
 
     /// Create debugging information entry for a c++
     /// style reference or rvalue reference type.
@@ -370,8 +375,9 @@ namespace llvm {
     ///                        includes return type at 0th index.
     /// \param Flags           E.g.: LValueReference.
     ///                        These flags are used to emit dwarf attributes.
+    /// \param CC              Calling convention, e.g. dwarf::DW_CC_normal
     DISubroutineType *createSubroutineType(DITypeRefArray ParameterTypes,
-                                           unsigned Flags = 0);
+                                           unsigned Flags = 0, unsigned CC = 0);
 
     /// Create an external type reference.
     /// \param Tag              Dwarf TAG.

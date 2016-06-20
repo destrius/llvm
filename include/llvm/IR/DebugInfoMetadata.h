@@ -45,21 +45,23 @@ namespace llvm {
 
 template <typename T> class Optional;
 
-/// \brief Pointer union between a subclass of DINode and MDString.
+/// Holds a subclass of DINode.
 ///
-/// \a DICompositeType can be referenced via an \a MDString unique identifier.
-/// This class allows some type safety in the face of that, requiring either a
-/// node of a particular type or an \a MDString.
+/// FIXME: This class doesn't currently make much sense.  Previously it was a
+/// union beteen MDString (for ODR-uniqued types) and things like DIType.  To
+/// support CodeView work, it wasn't deleted outright when MDString-based type
+/// references were deleted; we'll soon need a similar concept for CodeView
+/// DITypeIndex.
 template <class T> class TypedDINodeRef {
   const Metadata *MD = nullptr;
 
 public:
   TypedDINodeRef() = default;
   TypedDINodeRef(std::nullptr_t) {}
+  TypedDINodeRef(const T *MD) : MD(MD) {}
 
-  /// \brief Construct from a raw pointer.
   explicit TypedDINodeRef(const Metadata *MD) : MD(MD) {
-    assert((!MD || isa<MDString>(MD) || isa<T>(MD)) && "Expected valid ref");
+    assert((!MD || isa<T>(MD)) && "Expected valid type ref");
   }
 
   template <class U>
@@ -71,26 +73,10 @@ public:
 
   operator Metadata *() const { return const_cast<Metadata *>(MD); }
 
+  T *resolve() const { return const_cast<T *>(cast_or_null<T>(MD)); }
+
   bool operator==(const TypedDINodeRef<T> &X) const { return MD == X.MD; }
   bool operator!=(const TypedDINodeRef<T> &X) const { return MD != X.MD; }
-
-  /// \brief Create a reference.
-  ///
-  /// Get a reference to \c N, using an \a MDString reference if available.
-  static TypedDINodeRef get(const T *N);
-
-  template <class MapTy> T *resolve(const MapTy &Map) const {
-    if (!MD)
-      return nullptr;
-
-    if (auto *Typed = dyn_cast<T>(MD))
-      return const_cast<T *>(Typed);
-
-    auto *S = cast<MDString>(MD);
-    auto I = Map.find(S);
-    assert(I != Map.end() && "Missing identifier in type map");
-    return cast<T>(I->second);
-  }
 };
 
 typedef TypedDINodeRef<DINode> DINodeRef;
@@ -188,7 +174,9 @@ public:
   enum DIFlags {
 #define HANDLE_DI_FLAG(ID, NAME) Flag##NAME = ID,
 #include "llvm/IR/DebugInfoFlags.def"
-    FlagAccessibility = FlagPrivate | FlagProtected | FlagPublic
+    FlagAccessibility = FlagPrivate | FlagProtected | FlagPublic,
+    FlagPtrToMemberRep = FlagSingleInheritance | FlagMultipleInheritance |
+                         FlagVirtualInheritance,
   };
 
   static unsigned getFlag(StringRef Flag);
@@ -200,8 +188,6 @@ public:
   /// any remaining (unrecognized) bits.
   static unsigned splitFlags(unsigned Flags,
                              SmallVectorImpl<unsigned> &SplitFlags);
-
-  DINodeRef getRef() const { return DINodeRef::get(this); }
 
   static bool classof(const Metadata *MD) {
     switch (MD->getMetadataID()) {
@@ -437,8 +423,6 @@ public:
                              : static_cast<Metadata *>(getOperand(0));
   }
 
-  DIScopeRef getRef() const { return DIScopeRef::get(this); }
-
   static bool classof(const Metadata *MD) {
     switch (MD->getMetadataID()) {
     default:
@@ -601,8 +585,6 @@ public:
   bool isLValueReference() const { return getFlags() & FlagLValueReference; }
   bool isRValueReference() const { return getFlags() & FlagRValueReference; }
   bool isExternalTypeRef() const { return getFlags() & FlagExternalTypeRef; }
-
-  DITypeRef getRef() const { return DITypeRef::get(this); }
 
   static bool classof(const Metadata *MD) {
     switch (MD->getMetadataID()) {
@@ -933,14 +915,6 @@ public:
   }
 };
 
-template <class T> TypedDINodeRef<T> TypedDINodeRef<T>::get(const T *N) {
-  if (N)
-    if (auto *Composite = dyn_cast<DICompositeType>(N))
-      if (auto *S = Composite->getRawIdentifier())
-        return TypedDINodeRef<T>(S);
-  return TypedDINodeRef<T>(N);
-}
-
 /// \brief Type array for a subprogram.
 ///
 /// TODO: Fold the array of types in directly as operands.
@@ -948,34 +922,43 @@ class DISubroutineType : public DIType {
   friend class LLVMContextImpl;
   friend class MDNode;
 
+  /// The calling convention used with DW_AT_calling_convention. Actually of
+  /// type dwarf::CallingConvention.
+  uint8_t CC;
+
   DISubroutineType(LLVMContext &C, StorageType Storage, unsigned Flags,
-                   ArrayRef<Metadata *> Ops)
+                   uint8_t CC, ArrayRef<Metadata *> Ops)
       : DIType(C, DISubroutineTypeKind, Storage, dwarf::DW_TAG_subroutine_type,
-               0, 0, 0, 0, Flags, Ops) {}
+               0, 0, 0, 0, Flags, Ops),
+        CC(CC) {}
   ~DISubroutineType() = default;
 
   static DISubroutineType *getImpl(LLVMContext &Context, unsigned Flags,
-                                   DITypeRefArray TypeArray,
+                                   uint8_t CC, DITypeRefArray TypeArray,
                                    StorageType Storage,
                                    bool ShouldCreate = true) {
-    return getImpl(Context, Flags, TypeArray.get(), Storage, ShouldCreate);
+    return getImpl(Context, Flags, CC, TypeArray.get(), Storage, ShouldCreate);
   }
   static DISubroutineType *getImpl(LLVMContext &Context, unsigned Flags,
-                                   Metadata *TypeArray, StorageType Storage,
+                                   uint8_t CC, Metadata *TypeArray,
+                                   StorageType Storage,
                                    bool ShouldCreate = true);
 
   TempDISubroutineType cloneImpl() const {
-    return getTemporary(getContext(), getFlags(), getTypeArray());
+    return getTemporary(getContext(), getFlags(), getCC(), getTypeArray());
   }
 
 public:
   DEFINE_MDNODE_GET(DISubroutineType,
-                    (unsigned Flags, DITypeRefArray TypeArray),
-                    (Flags, TypeArray))
-  DEFINE_MDNODE_GET(DISubroutineType, (unsigned Flags, Metadata *TypeArray),
-                    (Flags, TypeArray))
+                    (unsigned Flags, uint8_t CC, DITypeRefArray TypeArray),
+                    (Flags, CC, TypeArray))
+  DEFINE_MDNODE_GET(DISubroutineType,
+                    (unsigned Flags, uint8_t CC, Metadata *TypeArray),
+                    (Flags, CC, TypeArray))
 
   TempDISubroutineType clone() const { return cloneImpl(); }
+
+  uint8_t getCC() const { return CC; }
 
   DITypeRefArray getTypeArray() const {
     return cast_or_null<MDTuple>(getRawTypeArray());
@@ -1162,6 +1145,12 @@ public:
   /// Return this if it's an \a DISubprogram; otherwise, look up the scope
   /// chain.
   DISubprogram *getSubprogram() const;
+
+  /// Get the first non DILexicalBlockFile scope of this scope.
+  ///
+  /// Return this if it's not a \a DILexicalBlockFIle; otherwise, look up the
+  /// scope chain.
+  DILocalScope *getNonLexicalBlockFileScope() const;
 
   static bool classof(const Metadata *MD) {
     return MD->getMetadataID() == DISubprogramKind ||

@@ -280,9 +280,14 @@ public:
     /// loop body even when the number of loop iterations is not known at
     /// compile time).
     bool Runtime;
+    /// Allow generation of a loop remainder (extra iterations after unroll).
+    bool AllowRemainder;
     /// Allow emitting expensive instructions (such as divisions) when computing
     /// the trip count of a loop for runtime unrolling.
     bool AllowExpensiveTripCount;
+    /// Apply loop unroll on any kind of loop
+    /// (mainly to loops that fail runtime unrolling).
+    bool Force;
   };
 
   /// \brief Get target-customized preferences for the generic loop unrolling
@@ -326,8 +331,7 @@ public:
                              unsigned AddrSpace = 0) const;
 
   /// \brief Return true if the target supports masked load/store
-  /// AVX2 and AVX-512 targets allow masks for consecutive load and store for
-  /// 32 and 64 bit elements.
+  /// AVX2 and AVX-512 targets allow masks for consecutive load and store
   bool isLegalMaskedStore(Type *DataType) const;
   bool isLegalMaskedLoad(Type *DataType) const;
 
@@ -438,6 +442,10 @@ public:
   /// \return The width of the largest scalar or vector register type.
   unsigned getRegisterBitWidth(bool Vector) const;
 
+  /// \return The bitwidth of the largest vector type that should be used to
+  /// load/store in the given address space.
+  unsigned getLoadStoreVecRegBitWidth(unsigned AddrSpace) const;
+
   /// \return The size of a cache line in bytes.
   unsigned getCacheLineSize() const;
 
@@ -476,6 +484,11 @@ public:
   /// \return The expected cost of cast instructions, such as bitcast, trunc,
   /// zext, etc.
   int getCastInstrCost(unsigned Opcode, Type *Dst, Type *Src) const;
+
+  /// \return The expected cost of a sign- or zero-extended vector extract. Use
+  /// -1 to indicate that there is no information about the index value.
+  int getExtractWithExtendCost(unsigned Opcode, Type *Dst, VectorType *VecTy,
+                               unsigned Index = -1) const;
 
   /// \return The expected cost of control-flow related instructions such as
   /// Phi, Ret, Br.
@@ -650,6 +663,7 @@ public:
                             Type *Ty) = 0;
   virtual unsigned getNumberOfRegisters(bool Vector) = 0;
   virtual unsigned getRegisterBitWidth(bool Vector) = 0;
+  virtual unsigned getLoadStoreVecRegBitWidth(unsigned AddrSpace) = 0;
   virtual unsigned getCacheLineSize() = 0;
   virtual unsigned getPrefetchDistance() = 0;
   virtual unsigned getMinPrefetchStride() = 0;
@@ -663,6 +677,8 @@ public:
   virtual int getShuffleCost(ShuffleKind Kind, Type *Tp, int Index,
                              Type *SubTp) = 0;
   virtual int getCastInstrCost(unsigned Opcode, Type *Dst, Type *Src) = 0;
+  virtual int getExtractWithExtendCost(unsigned Opcode, Type *Dst,
+                                       VectorType *VecTy, unsigned Index) = 0;
   virtual int getCFInstrCost(unsigned Opcode) = 0;
   virtual int getCmpSelInstrCost(unsigned Opcode, Type *ValTy,
                                  Type *CondTy) = 0;
@@ -828,6 +844,11 @@ public:
   unsigned getRegisterBitWidth(bool Vector) override {
     return Impl.getRegisterBitWidth(Vector);
   }
+
+  unsigned getLoadStoreVecRegBitWidth(unsigned AddrSpace) override {
+    return Impl.getLoadStoreVecRegBitWidth(AddrSpace);
+  }
+
   unsigned getCacheLineSize() override {
     return Impl.getCacheLineSize();
   }
@@ -855,6 +876,10 @@ public:
   }
   int getCastInstrCost(unsigned Opcode, Type *Dst, Type *Src) override {
     return Impl.getCastInstrCost(Opcode, Dst, Src);
+  }
+  int getExtractWithExtendCost(unsigned Opcode, Type *Dst, VectorType *VecTy,
+                               unsigned Index) override {
+    return Impl.getExtractWithExtendCost(Opcode, Dst, VecTy, Index);
   }
   int getCFInstrCost(unsigned Opcode) override {
     return Impl.getCFInstrCost(Opcode);
@@ -970,7 +995,7 @@ public:
     return *this;
   }
 
-  Result run(const Function &F);
+  Result run(const Function &F, AnalysisManager<Function> &);
 
 private:
   friend AnalysisInfoMixin<TargetIRAnalysis>;

@@ -14,6 +14,11 @@
 
 #include "llvm/LTO/ThinLTOCodeGenerator.h"
 
+#ifdef HAVE_LLVM_REVISION
+#include "LLVMLTORevision.h"
+#endif
+
+#include "UpdateCompilerUsed.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/ModuleSummaryAnalysis.h"
@@ -27,19 +32,26 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/LTO/LTO.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/MC/SubtargetFeature.h"
+#include "llvm/Object/IRObjectFile.h"
 #include "llvm/Object/ModuleSummaryIndexObjectFile.h"
+#include "llvm/Support/CachePruning.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/SHA1.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/ThreadPool.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/FunctionImport.h"
+#include "llvm/Transforms/IPO/Internalize.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
+
+#include <numeric>
 
 using namespace llvm;
 
@@ -61,28 +73,6 @@ static void diagnosticHandler(const DiagnosticInfo &DI) {
   errs() << '\n';
 }
 
-// Simple helper to load a module from bitcode
-static std::unique_ptr<Module>
-loadModuleFromBuffer(const MemoryBufferRef &Buffer, LLVMContext &Context,
-                     bool Lazy) {
-  SMDiagnostic Err;
-  ErrorOr<std::unique_ptr<Module>> ModuleOrErr(nullptr);
-  if (Lazy) {
-    ModuleOrErr =
-        getLazyBitcodeModule(MemoryBuffer::getMemBuffer(Buffer, false), Context,
-                             /* ShouldLazyLoadMetadata */ Lazy);
-  } else {
-    ModuleOrErr = parseBitcodeFile(Buffer, Context);
-  }
-  if (std::error_code EC = ModuleOrErr.getError()) {
-    Err = SMDiagnostic(Buffer.getBufferIdentifier(), SourceMgr::DK_Error,
-                       EC.message());
-    Err.print("ThinLTO", errs());
-    report_fatal_error("Can't load module, abort.");
-  }
-  return std::move(ModuleOrErr.get());
-}
-
 // Simple helper to save temporary files for debug.
 static void saveTempBitcode(const Module &TheModule, StringRef TempDir,
                             unsigned count, StringRef Suffix) {
@@ -98,120 +88,43 @@ static void saveTempBitcode(const Module &TheModule, StringRef TempDir,
   WriteBitcodeToFile(&TheModule, OS, /* ShouldPreserveUseListOrder */ true);
 }
 
-bool IsFirstDefinitionForLinker(const GlobalValueInfoList &GVInfo,
-                                const ModuleSummaryIndex &Index,
-                                StringRef ModulePath) {
+static const GlobalValueSummary *
+getFirstDefinitionForLinker(const GlobalValueSummaryList &GVSummaryList) {
+  // If there is any strong definition anywhere, get it.
+  auto StrongDefForLinker = llvm::find_if(
+      GVSummaryList, [](const std::unique_ptr<GlobalValueSummary> &Summary) {
+        auto Linkage = Summary->linkage();
+        return !GlobalValue::isAvailableExternallyLinkage(Linkage) &&
+               !GlobalValue::isWeakForLinker(Linkage);
+      });
+  if (StrongDefForLinker != GVSummaryList.end())
+    return StrongDefForLinker->get();
   // Get the first *linker visible* definition for this global in the summary
   // list.
   auto FirstDefForLinker = llvm::find_if(
-      GVInfo, [](const std::unique_ptr<GlobalValueInfo> &FuncInfo) {
-        auto Linkage = FuncInfo->summary()->linkage();
+      GVSummaryList, [](const std::unique_ptr<GlobalValueSummary> &Summary) {
+        auto Linkage = Summary->linkage();
         return !GlobalValue::isAvailableExternallyLinkage(Linkage);
       });
-  // If \p GV is not the first definition, give up...
-  if ((*FirstDefForLinker)->summary()->modulePath() != ModulePath)
-    return false;
-  // If there is any strong definition anywhere, do not bother emitting this.
-  if (llvm::any_of(
-          GVInfo, [](const std::unique_ptr<GlobalValueInfo> &FuncInfo) {
-            auto Linkage = FuncInfo->summary()->linkage();
-            return !GlobalValue::isAvailableExternallyLinkage(Linkage) &&
-                   !GlobalValue::isWeakForLinker(Linkage);
-          }))
-    return false;
-  return true;
+  // Extern templates can be emitted as available_externally.
+  if (FirstDefForLinker == GVSummaryList.end())
+    return nullptr;
+  return FirstDefForLinker->get();
 }
 
-static GlobalValue::LinkageTypes ResolveODR(const ModuleSummaryIndex &Index,
-                                            StringRef ModuleIdentifier,
-                                            GlobalValue::GUID GUID,
-                                            const GlobalValueSummary &GV) {
-  auto HasMultipleCopies =
-      [&](const GlobalValueInfoList &GVInfo) { return GVInfo.size() > 1; };
-
-  auto OriginalLinkage = GV.linkage();
-  switch (OriginalLinkage) {
-  case GlobalValue::ExternalLinkage:
-  case GlobalValue::AvailableExternallyLinkage:
-  case GlobalValue::AppendingLinkage:
-  case GlobalValue::InternalLinkage:
-  case GlobalValue::PrivateLinkage:
-  case GlobalValue::ExternalWeakLinkage:
-  case GlobalValue::CommonLinkage:
-  case GlobalValue::LinkOnceAnyLinkage:
-  case GlobalValue::WeakAnyLinkage:
-    break;
-  case GlobalValue::LinkOnceODRLinkage:
-  case GlobalValue::WeakODRLinkage: {
-    auto &GVInfo = Index.findGlobalValueInfoList(GUID)->second;
-    // We need to emit only one of these, the first module will keep
-    // it, but turned into a weak while the others will drop it.
-    if (!HasMultipleCopies(GVInfo))
-      break;
-    if (IsFirstDefinitionForLinker(GVInfo, Index, ModuleIdentifier))
-      return GlobalValue::WeakODRLinkage;
-    else
-      return GlobalValue::AvailableExternallyLinkage;
-    break;
-  }
-  }
-  return OriginalLinkage;
-}
-
-/// Resolve LinkOnceODR and WeakODR.
-///
-/// We'd like to drop these function if they are no longer referenced in the
-/// current module. However there is a chance that another module is still
-/// referencing them because of the import. We make sure we always emit at least
-/// one copy.
-static void ResolveODR(
+// Populate map of GUID to the prevailing copy for any multiply defined
+// symbols. Currently assume first copy is prevailing, or any strong
+// definition. Can be refined with Linker information in the future.
+static void computePrevailingCopies(
     const ModuleSummaryIndex &Index,
-    const std::map<GlobalValue::GUID, GlobalValueSummary *> &DefinedGlobals,
-    StringRef ModuleIdentifier,
-    DenseMap<GlobalValue::GUID, GlobalValue::LinkageTypes> &ResolvedODR) {
-  if (Index.modulePaths().size() == 1)
-    // Nothing to do if we don't have multiple modules
-    return;
+    DenseMap<GlobalValue::GUID, const GlobalValueSummary *> &PrevailingCopy) {
+  auto HasMultipleCopies = [&](const GlobalValueSummaryList &GVSummaryList) {
+    return GVSummaryList.size() > 1;
+  };
 
-  // We won't optimize the globals that are referenced by an alias for now
-  // Ideally we should turn the alias into a global and duplicate the definition
-  // when needed.
-  DenseSet<GlobalValueSummary *> GlobalInvolvedWithAlias;
-  for (auto &GA : DefinedGlobals) {
-    if (auto AS = dyn_cast<AliasSummary>(GA.second))
-      GlobalInvolvedWithAlias.insert(&AS->getAliasee());
-  }
-
-  for (auto &GV : DefinedGlobals) {
-    if (GlobalInvolvedWithAlias.count(GV.second))
-      continue;
-    auto NewLinkage = ResolveODR(Index, ModuleIdentifier, GV.first, *GV.second);
-    if (NewLinkage != GV.second->linkage()) {
-      ResolvedODR[GV.first] = NewLinkage;
-    }
-  }
-}
-
-/// Fixup linkage, see ResolveODR() above.
-void fixupODR(
-    Module &TheModule,
-    const DenseMap<GlobalValue::GUID, GlobalValue::LinkageTypes> &ResolvedODR) {
-  // Process functions and global now
-  for (auto &GV : TheModule) {
-    auto NewLinkage = ResolvedODR.find(GV.getGUID());
-    if (NewLinkage == ResolvedODR.end())
-      continue;
-    DEBUG(dbgs() << "ODR fixing up linkage for `" << GV.getName() << "` from "
-                 << GV.getLinkage() << " to " << NewLinkage->second << "\n");
-    GV.setLinkage(NewLinkage->second);
-  }
-  for (auto &GV : TheModule.globals()) {
-    auto NewLinkage = ResolvedODR.find(GV.getGUID());
-    if (NewLinkage == ResolvedODR.end())
-      continue;
-    DEBUG(dbgs() << "ODR fixing up linkage for `" << GV.getName() << "` from "
-                 << GV.getLinkage() << " to " << NewLinkage->second << "\n");
-    GV.setLinkage(NewLinkage->second);
+  for (auto &I : Index) {
+    if (HasMultipleCopies(I.second))
+      PrevailingCopy[I.first] = getFirstDefinitionForLinker(I.second);
   }
 }
 
@@ -226,26 +139,6 @@ generateModuleMap(const std::vector<MemoryBufferRef> &Modules) {
   }
   return ModuleMap;
 }
-
-/// Provide a "loader" for the FunctionImporter to access function from other
-/// modules.
-class ModuleLoader {
-  /// The context that will be used for importing.
-  LLVMContext &Context;
-
-  /// Map from Module identifier to MemoryBuffer. Used by clients like the
-  /// FunctionImported to request loading a Module.
-  StringMap<MemoryBufferRef> &ModuleMap;
-
-public:
-  ModuleLoader(LLVMContext &Context, StringMap<MemoryBufferRef> &ModuleMap)
-      : Context(Context), ModuleMap(ModuleMap) {}
-
-  /// Load a module on demand.
-  std::unique_ptr<Module> operator()(StringRef Identifier) {
-    return loadModuleFromBuffer(ModuleMap[Identifier], Context, /*Lazy*/ true);
-  }
-};
 
 static void promoteModule(Module &TheModule, const ModuleSummaryIndex &Index) {
   if (renameModuleForThinLTO(TheModule, Index))
@@ -285,6 +178,20 @@ static void optimizeModule(Module &TheModule, TargetMachine &TM) {
   PM.run(TheModule);
 }
 
+// Convert the PreservedSymbols map from "Name" based to "GUID" based.
+static DenseSet<GlobalValue::GUID>
+computeGUIDPreservedSymbols(const StringSet<> &PreservedSymbols,
+                            const Triple &TheTriple) {
+  DenseSet<GlobalValue::GUID> GUIDPreservedSymbols(PreservedSymbols.size());
+  for (auto &Entry : PreservedSymbols) {
+    StringRef Name = Entry.first();
+    if (TheTriple.isOSBinFormatMachO() && Name.size() > 0 && Name[0] == '_')
+      Name = Name.drop_front();
+    GUIDPreservedSymbols.insert(GlobalValue::getGUID(Name));
+  }
+  return GUIDPreservedSymbols;
+}
+
 std::unique_ptr<MemoryBuffer> codegenModule(Module &TheModule,
                                             TargetMachine &TM) {
   SmallVector<char, 128> OutputBuffer;
@@ -309,16 +216,128 @@ std::unique_ptr<MemoryBuffer> codegenModule(Module &TheModule,
   return make_unique<ObjectMemoryBuffer>(std::move(OutputBuffer));
 }
 
-static std::unique_ptr<MemoryBuffer> ProcessThinLTOModule(
-    Module &TheModule, const ModuleSummaryIndex &Index,
-    StringMap<MemoryBufferRef> &ModuleMap, TargetMachine &TM,
-    const FunctionImporter::ImportMapTy &ImportList,
-    DenseMap<GlobalValue::GUID, GlobalValue::LinkageTypes> &ResolvedODR,
-    ThinLTOCodeGenerator::CachingOptions CacheOptions, bool DisableCodeGen,
-    StringRef SaveTempsDir, unsigned count) {
+/// Manage caching for a single Module.
+class ModuleCacheEntry {
+  SmallString<128> EntryPath;
 
-  // Save temps: after IPO.
-  saveTempBitcode(TheModule, SaveTempsDir, count, ".1.IPO.bc");
+public:
+  // Create a cache entry. This compute a unique hash for the Module considering
+  // the current list of export/import, and offer an interface to query to
+  // access the content in the cache.
+  ModuleCacheEntry(
+      StringRef CachePath, const ModuleSummaryIndex &Index, StringRef ModuleID,
+      const FunctionImporter::ImportMapTy &ImportList,
+      const FunctionImporter::ExportSetTy &ExportList,
+      const std::map<GlobalValue::GUID, GlobalValue::LinkageTypes> &ResolvedODR,
+      const GVSummaryMapTy &DefinedFunctions,
+      const DenseSet<GlobalValue::GUID> &PreservedSymbols) {
+    if (CachePath.empty())
+      return;
+
+    // Compute the unique hash for this entry
+    // This is based on the current compiler version, the module itself, the
+    // export list, the hash for every single module in the import list, the
+    // list of ResolvedODR for the module, and the list of preserved symbols.
+
+    SHA1 Hasher;
+
+    // Start with the compiler revision
+    Hasher.update(LLVM_VERSION_STRING);
+#ifdef HAVE_LLVM_REVISION
+    Hasher.update(LLVM_REVISION);
+#endif
+
+    // Include the hash for the current module
+    auto ModHash = Index.getModuleHash(ModuleID);
+    Hasher.update(ArrayRef<uint8_t>((uint8_t *)&ModHash[0], sizeof(ModHash)));
+    for (auto F : ExportList)
+      // The export list can impact the internalization, be conservative here
+      Hasher.update(ArrayRef<uint8_t>((uint8_t *)&F, sizeof(F)));
+
+    // Include the hash for every module we import functions from
+    for (auto &Entry : ImportList) {
+      auto ModHash = Index.getModuleHash(Entry.first());
+      Hasher.update(ArrayRef<uint8_t>((uint8_t *)&ModHash[0], sizeof(ModHash)));
+    }
+
+    // Include the hash for the resolved ODR.
+    for (auto &Entry : ResolvedODR) {
+      Hasher.update(ArrayRef<uint8_t>((const uint8_t *)&Entry.first,
+                                      sizeof(GlobalValue::GUID)));
+      Hasher.update(ArrayRef<uint8_t>((const uint8_t *)&Entry.second,
+                                      sizeof(GlobalValue::LinkageTypes)));
+    }
+
+    // Include the hash for the preserved symbols.
+    for (auto &Entry : PreservedSymbols) {
+      if (DefinedFunctions.count(Entry))
+        Hasher.update(
+            ArrayRef<uint8_t>((const uint8_t *)&Entry, sizeof(GlobalValue::GUID)));
+    }
+
+    sys::path::append(EntryPath, CachePath, toHex(Hasher.result()));
+  }
+
+  // Access the path to this entry in the cache.
+  StringRef getEntryPath() { return EntryPath; }
+
+  // Try loading the buffer for this cache entry.
+  ErrorOr<std::unique_ptr<MemoryBuffer>> tryLoadingBuffer() {
+    if (EntryPath.empty())
+      return std::error_code();
+    return MemoryBuffer::getFile(EntryPath);
+  }
+
+  // Cache the Produced object file
+  std::unique_ptr<MemoryBuffer>
+  write(std::unique_ptr<MemoryBuffer> OutputBuffer) {
+    if (EntryPath.empty())
+      return OutputBuffer;
+
+    // Write to a temporary to avoid race condition
+    SmallString<128> TempFilename;
+    int TempFD;
+    std::error_code EC =
+        sys::fs::createTemporaryFile("Thin", "tmp.o", TempFD, TempFilename);
+    if (EC) {
+      errs() << "Error: " << EC.message() << "\n";
+      report_fatal_error("ThinLTO: Can't get a temporary file");
+    }
+    {
+      raw_fd_ostream OS(TempFD, /* ShouldClose */ true);
+      OS << OutputBuffer->getBuffer();
+    }
+    // Rename to final destination (hopefully race condition won't matter here)
+    EC = sys::fs::rename(TempFilename, EntryPath);
+    if (EC) {
+      sys::fs::remove(TempFilename);
+      raw_fd_ostream OS(EntryPath, EC, sys::fs::F_None);
+      if (EC)
+        report_fatal_error(Twine("Failed to open ") + EntryPath +
+                           " to save cached entry\n");
+      OS << OutputBuffer->getBuffer();
+    }
+    auto ReloadedBufferOrErr = MemoryBuffer::getFile(EntryPath);
+    if (auto EC = ReloadedBufferOrErr.getError()) {
+      // FIXME diagnose
+      errs() << "error: can't reload cached file '" << EntryPath
+             << "': " << EC.message() << "\n";
+      return OutputBuffer;
+    }
+    return std::move(*ReloadedBufferOrErr);
+  }
+};
+
+static std::unique_ptr<MemoryBuffer>
+ProcessThinLTOModule(Module &TheModule, ModuleSummaryIndex &Index,
+                     StringMap<MemoryBufferRef> &ModuleMap, TargetMachine &TM,
+                     const FunctionImporter::ImportMapTy &ImportList,
+                     const FunctionImporter::ExportSetTy &ExportList,
+                     const DenseSet<GlobalValue::GUID> &GUIDPreservedSymbols,
+                     const GVSummaryMapTy &DefinedGlobals,
+                     const ThinLTOCodeGenerator::CachingOptions &CacheOptions,
+                     bool DisableCodeGen, StringRef SaveTempsDir,
+                     unsigned count) {
 
   // "Benchmark"-like optimization: single-source case
   bool SingleModule = (ModuleMap.size() == 1);
@@ -326,14 +345,24 @@ static std::unique_ptr<MemoryBuffer> ProcessThinLTOModule(
   if (!SingleModule) {
     promoteModule(TheModule, Index);
 
-    // Resolve the LinkOnce/Weak ODR, trying to turn them into
-    // "available_externally" when possible.
-    // This is a compile-time optimization.
-    fixupODR(TheModule, ResolvedODR);
+    // Apply summary-based LinkOnce/Weak resolution decisions.
+    thinLTOResolveWeakForLinkerModule(TheModule, DefinedGlobals);
 
     // Save temps: after promotion.
-    saveTempBitcode(TheModule, SaveTempsDir, count, ".2.promoted.bc");
+    saveTempBitcode(TheModule, SaveTempsDir, count, ".1.promoted.bc");
+  }
 
+  // Be friendly and don't nuke totally the module when the client didn't
+  // supply anything to preserve.
+  if (!ExportList.empty() || !GUIDPreservedSymbols.empty()) {
+    // Apply summary-based internalization decisions.
+    thinLTOInternalizeModule(TheModule, DefinedGlobals);
+  }
+
+  // Save internalized bitcode
+  saveTempBitcode(TheModule, SaveTempsDir, count, ".2.internalized.bc");
+
+  if (!SingleModule) {
     crossImportIntoModule(TheModule, Index, ModuleMap, ImportList);
 
     // Save temps: after cross-module import.
@@ -342,7 +371,7 @@ static std::unique_ptr<MemoryBuffer> ProcessThinLTOModule(
 
   optimizeModule(TheModule, TM);
 
-  saveTempBitcode(TheModule, SaveTempsDir, count, ".3.opt.bc");
+  saveTempBitcode(TheModule, SaveTempsDir, count, ".4.opt.bc");
 
   if (DisableCodeGen) {
     // Configured to stop before CodeGen, serialize the bitcode and return.
@@ -356,6 +385,46 @@ static std::unique_ptr<MemoryBuffer> ProcessThinLTOModule(
   }
 
   return codegenModule(TheModule, TM);
+}
+
+/// Resolve LinkOnce/Weak symbols. Record resolutions in the \p ResolvedODR map
+/// for caching, and in the \p Index for application during the ThinLTO
+/// backends. This is needed for correctness for exported symbols (ensure
+/// at least one copy kept) and a compile-time optimization (to drop duplicate
+/// copies when possible).
+static void resolveWeakForLinkerInIndex(
+    ModuleSummaryIndex &Index,
+    const StringMap<FunctionImporter::ExportSetTy> &ExportLists,
+    const DenseSet<GlobalValue::GUID> &GUIDPreservedSymbols,
+    StringMap<std::map<GlobalValue::GUID, GlobalValue::LinkageTypes>>
+        &ResolvedODR) {
+
+  DenseMap<GlobalValue::GUID, const GlobalValueSummary *> PrevailingCopy;
+  computePrevailingCopies(Index, PrevailingCopy);
+
+  auto isPrevailing = [&](GlobalValue::GUID GUID, const GlobalValueSummary *S) {
+    const auto &Prevailing = PrevailingCopy.find(GUID);
+    // Not in map means that there was only one copy, which must be prevailing.
+    if (Prevailing == PrevailingCopy.end())
+      return true;
+    return Prevailing->second == S;
+  };
+
+  auto isExported = [&](StringRef ModuleIdentifier, GlobalValue::GUID GUID) {
+    const auto &ExportList = ExportLists.find(ModuleIdentifier);
+    return (ExportList != ExportLists.end() &&
+            ExportList->second.count(GUID)) ||
+           GUIDPreservedSymbols.count(GUID);
+  };
+
+  auto recordNewLinkage = [&](StringRef ModuleIdentifier,
+                              GlobalValue::GUID GUID,
+                              GlobalValue::LinkageTypes NewLinkage) {
+    ResolvedODR[ModuleIdentifier][GUID] = NewLinkage;
+  };
+
+  thinLTOResolveWeakForLinkerInIndex(Index, isPrevailing, isExported,
+                                     recordNewLinkage);
 }
 
 // Initialize the TargetMachine builder for a given Triple
@@ -400,7 +469,10 @@ void ThinLTOCodeGenerator::preserveSymbol(StringRef Name) {
 }
 
 void ThinLTOCodeGenerator::crossReferenceSymbol(StringRef Name) {
-  CrossReferencedSymbols.insert(Name);
+  // FIXME: At the moment, we don't take advantage of this extra information,
+  // we're conservatively considering cross-references as preserved.
+  //  CrossReferencedSymbols.insert(Name);
+  PreservedSymbols.insert(Name);
 }
 
 // TargetMachine factory
@@ -431,7 +503,7 @@ std::unique_ptr<ModuleSummaryIndex> ThinLTOCodeGenerator::linkCombinedIndex() {
   for (auto &ModuleBuffer : Modules) {
     ErrorOr<std::unique_ptr<object::ModuleSummaryIndexObjectFile>> ObjOrErr =
         object::ModuleSummaryIndexObjectFile::create(ModuleBuffer,
-                                                     diagnosticHandler, false);
+                                                     diagnosticHandler);
     if (std::error_code EC = ObjOrErr.getError()) {
       // FIXME diagnose
       errs() << "error: can't create ModuleSummaryIndexObjectFile for buffer: "
@@ -450,22 +522,33 @@ std::unique_ptr<ModuleSummaryIndex> ThinLTOCodeGenerator::linkCombinedIndex() {
 
 /**
  * Perform promotion and renaming of exported internal functions.
+ * Index is updated to reflect linkage changes from weak resolution.
  */
 void ThinLTOCodeGenerator::promote(Module &TheModule,
                                    ModuleSummaryIndex &Index) {
+  auto ModuleCount = Index.modulePaths().size();
   auto ModuleIdentifier = TheModule.getModuleIdentifier();
   // Collect for each module the list of function it defines (GUID -> Summary).
-  StringMap<std::map<GlobalValue::GUID, GlobalValueSummary *>>
-      ModuleToDefinedGVSummaries;
+  StringMap<GVSummaryMapTy> ModuleToDefinedGVSummaries;
   Index.collectDefinedGVSummariesPerModule(ModuleToDefinedGVSummaries);
 
-  // Resolve the LinkOnceODR, trying to turn them into "available_externally"
-  // where possible.
-  // This is a compile-time optimization.
-  DenseMap<GlobalValue::GUID, GlobalValue::LinkageTypes> ResolvedODR;
-  ResolveODR(Index, ModuleToDefinedGVSummaries[ModuleIdentifier],
-             ModuleIdentifier, ResolvedODR);
-  fixupODR(TheModule, ResolvedODR);
+  // Generate import/export list
+  StringMap<FunctionImporter::ImportMapTy> ImportLists(ModuleCount);
+  StringMap<FunctionImporter::ExportSetTy> ExportLists(ModuleCount);
+  ComputeCrossModuleImport(Index, ModuleToDefinedGVSummaries, ImportLists,
+                           ExportLists);
+
+  // Convert the preserved symbols set from string to GUID
+  auto GUIDPreservedSymbols =
+  computeGUIDPreservedSymbols(PreservedSymbols, TMBuilder.TheTriple);
+
+  // Resolve LinkOnce/Weak symbols.
+  StringMap<std::map<GlobalValue::GUID, GlobalValue::LinkageTypes>> ResolvedODR;
+  resolveWeakForLinkerInIndex(Index, ExportLists, GUIDPreservedSymbols,
+                              ResolvedODR);
+
+  thinLTOResolveWeakForLinkerModule(
+      TheModule, ModuleToDefinedGVSummaries[ModuleIdentifier]);
 
   promoteModule(TheModule, Index);
 }
@@ -479,8 +562,7 @@ void ThinLTOCodeGenerator::crossModuleImport(Module &TheModule,
   auto ModuleCount = Index.modulePaths().size();
 
   // Collect for each module the list of function it defines (GUID -> Summary).
-  StringMap<std::map<GlobalValue::GUID, GlobalValueSummary *>>
-      ModuleToDefinedGVSummaries(ModuleCount);
+  StringMap<GVSummaryMapTy> ModuleToDefinedGVSummaries(ModuleCount);
   Index.collectDefinedGVSummariesPerModule(ModuleToDefinedGVSummaries);
 
   // Generate import/export list
@@ -494,10 +576,100 @@ void ThinLTOCodeGenerator::crossModuleImport(Module &TheModule,
 }
 
 /**
+ * Compute the list of summaries needed for importing into module.
+ */
+void ThinLTOCodeGenerator::gatherImportedSummariesForModule(
+    StringRef ModulePath, ModuleSummaryIndex &Index,
+    std::map<std::string, GVSummaryMapTy> &ModuleToSummariesForIndex) {
+  auto ModuleCount = Index.modulePaths().size();
+
+  // Collect for each module the list of function it defines (GUID -> Summary).
+  StringMap<GVSummaryMapTy> ModuleToDefinedGVSummaries(ModuleCount);
+  Index.collectDefinedGVSummariesPerModule(ModuleToDefinedGVSummaries);
+
+  // Generate import/export list
+  StringMap<FunctionImporter::ImportMapTy> ImportLists(ModuleCount);
+  StringMap<FunctionImporter::ExportSetTy> ExportLists(ModuleCount);
+  ComputeCrossModuleImport(Index, ModuleToDefinedGVSummaries, ImportLists,
+                           ExportLists);
+
+  llvm::gatherImportedSummariesForModule(ModulePath, ModuleToDefinedGVSummaries,
+                                         ImportLists,
+                                         ModuleToSummariesForIndex);
+}
+
+/**
+ * Emit the list of files needed for importing into module.
+ */
+void ThinLTOCodeGenerator::emitImports(StringRef ModulePath,
+                                       StringRef OutputName,
+                                       ModuleSummaryIndex &Index) {
+  auto ModuleCount = Index.modulePaths().size();
+
+  // Collect for each module the list of function it defines (GUID -> Summary).
+  StringMap<GVSummaryMapTy> ModuleToDefinedGVSummaries(ModuleCount);
+  Index.collectDefinedGVSummariesPerModule(ModuleToDefinedGVSummaries);
+
+  // Generate import/export list
+  StringMap<FunctionImporter::ImportMapTy> ImportLists(ModuleCount);
+  StringMap<FunctionImporter::ExportSetTy> ExportLists(ModuleCount);
+  ComputeCrossModuleImport(Index, ModuleToDefinedGVSummaries, ImportLists,
+                           ExportLists);
+
+  std::error_code EC;
+  if ((EC = EmitImportsFiles(ModulePath, OutputName, ImportLists)))
+    report_fatal_error(Twine("Failed to open ") + OutputName +
+                       " to save imports lists\n");
+}
+
+/**
+ * Perform internalization. Index is updated to reflect linkage changes.
+ */
+void ThinLTOCodeGenerator::internalize(Module &TheModule,
+                                       ModuleSummaryIndex &Index) {
+  initTMBuilder(TMBuilder, Triple(TheModule.getTargetTriple()));
+  auto ModuleCount = Index.modulePaths().size();
+  auto ModuleIdentifier = TheModule.getModuleIdentifier();
+
+  // Convert the preserved symbols set from string to GUID
+  auto GUIDPreservedSymbols =
+      computeGUIDPreservedSymbols(PreservedSymbols, TMBuilder.TheTriple);
+
+  // Collect for each module the list of function it defines (GUID -> Summary).
+  StringMap<GVSummaryMapTy> ModuleToDefinedGVSummaries(ModuleCount);
+  Index.collectDefinedGVSummariesPerModule(ModuleToDefinedGVSummaries);
+
+  // Generate import/export list
+  StringMap<FunctionImporter::ImportMapTy> ImportLists(ModuleCount);
+  StringMap<FunctionImporter::ExportSetTy> ExportLists(ModuleCount);
+  ComputeCrossModuleImport(Index, ModuleToDefinedGVSummaries, ImportLists,
+                           ExportLists);
+  auto &ExportList = ExportLists[ModuleIdentifier];
+
+  // Be friendly and don't nuke totally the module when the client didn't
+  // supply anything to preserve.
+  if (ExportList.empty() && GUIDPreservedSymbols.empty())
+    return;
+
+  // Internalization
+  auto isExported = [&](StringRef ModuleIdentifier, GlobalValue::GUID GUID) {
+    const auto &ExportList = ExportLists.find(ModuleIdentifier);
+    return (ExportList != ExportLists.end() &&
+            ExportList->second.count(GUID)) ||
+           GUIDPreservedSymbols.count(GUID);
+  };
+  thinLTOInternalizeAndPromoteInIndex(Index, isExported);
+  thinLTOInternalizeModule(TheModule,
+                           ModuleToDefinedGVSummaries[ModuleIdentifier]);
+}
+
+/**
  * Perform post-importing ThinLTO optimizations.
  */
 void ThinLTOCodeGenerator::optimize(Module &TheModule) {
   initTMBuilder(TMBuilder, Triple(TheModule.getTargetTriple()));
+
+  // Optimize now
   optimizeModule(TheModule, *TMBuilder.create());
 }
 
@@ -556,8 +728,7 @@ void ThinLTOCodeGenerator::run() {
   auto ModuleCount = Modules.size();
 
   // Collect for each module the list of function it defines (GUID -> Summary).
-  StringMap<std::map<GlobalValue::GUID, GlobalValueSummary *>>
-      ModuleToDefinedGVSummaries(ModuleCount);
+  StringMap<GVSummaryMapTy> ModuleToDefinedGVSummaries(ModuleCount);
   Index->collectDefinedGVSummariesPerModule(ModuleToDefinedGVSummaries);
 
   // Collect the import/export lists for all modules from the call-graph in the
@@ -567,37 +738,113 @@ void ThinLTOCodeGenerator::run() {
   ComputeCrossModuleImport(*Index, ModuleToDefinedGVSummaries, ImportLists,
                            ExportLists);
 
+  // Convert the preserved symbols set from string to GUID, this is needed for
+  // computing the caching hash and the internalization.
+  auto GUIDPreservedSymbols =
+      computeGUIDPreservedSymbols(PreservedSymbols, TMBuilder.TheTriple);
+
+  // We use a std::map here to be able to have a defined ordering when
+  // producing a hash for the cache entry.
+  // FIXME: we should be able to compute the caching hash for the entry based
+  // on the index, and nuke this map.
+  StringMap<std::map<GlobalValue::GUID, GlobalValue::LinkageTypes>> ResolvedODR;
+
+  // Resolve LinkOnce/Weak symbols, this has to be computed early because it
+  // impacts the caching.
+  resolveWeakForLinkerInIndex(*Index, ExportLists, GUIDPreservedSymbols,
+                              ResolvedODR);
+
+  auto isExported = [&](StringRef ModuleIdentifier, GlobalValue::GUID GUID) {
+    const auto &ExportList = ExportLists.find(ModuleIdentifier);
+    return (ExportList != ExportLists.end() &&
+            ExportList->second.count(GUID)) ||
+           GUIDPreservedSymbols.count(GUID);
+  };
+
+  // Use global summary-based analysis to identify symbols that can be
+  // internalized (because they aren't exported or preserved as per callback).
+  // Changes are made in the index, consumed in the ThinLTO backends.
+  thinLTOInternalizeAndPromoteInIndex(*Index, isExported);
+
+  // Make sure that every module has an entry in the ExportLists and
+  // ResolvedODR maps to enable threaded access to these maps below.
+  for (auto &DefinedGVSummaries : ModuleToDefinedGVSummaries) {
+    ExportLists[DefinedGVSummaries.first()];
+    ResolvedODR[DefinedGVSummaries.first()];
+  }
+
+  // Compute the ordering we will process the inputs: the rough heuristic here
+  // is to sort them per size so that the largest module get schedule as soon as
+  // possible. This is purely a compile-time optimization.
+  std::vector<int> ModulesOrdering;
+  ModulesOrdering.resize(Modules.size());
+  std::iota(ModulesOrdering.begin(), ModulesOrdering.end(), 0);
+  std::sort(ModulesOrdering.begin(), ModulesOrdering.end(),
+            [&](int LeftIndex, int RightIndex) {
+              auto LSize = Modules[LeftIndex].getBufferSize();
+              auto RSize = Modules[RightIndex].getBufferSize();
+              return LSize > RSize;
+            });
+
   // Parallel optimizer + codegen
   {
     ThreadPool Pool(ThreadCount);
-    int count = 0;
-    for (auto &ModuleBuffer : Modules) {
+    for (auto IndexCount : ModulesOrdering) {
+      auto &ModuleBuffer = Modules[IndexCount];
       Pool.async([&](int count) {
+        auto ModuleIdentifier = ModuleBuffer.getBufferIdentifier();
+        auto &ExportList = ExportLists[ModuleIdentifier];
+
+        auto &DefinedFunctions = ModuleToDefinedGVSummaries[ModuleIdentifier];
+
+        // The module may be cached, this helps handling it.
+        ModuleCacheEntry CacheEntry(CacheOptions.Path, *Index, ModuleIdentifier,
+                                    ImportLists[ModuleIdentifier], ExportList,
+                                    ResolvedODR[ModuleIdentifier],
+                                    DefinedFunctions, GUIDPreservedSymbols);
+
+        {
+          auto ErrOrBuffer = CacheEntry.tryLoadingBuffer();
+          DEBUG(dbgs() << "Cache " << (ErrOrBuffer ? "hit" : "miss") << " '"
+                       << CacheEntry.getEntryPath() << "' for buffer " << count
+                       << " " << ModuleIdentifier << "\n");
+
+          if (ErrOrBuffer) {
+            // Cache Hit!
+            ProducedBinaries[count] = std::move(ErrOrBuffer.get());
+            return;
+          }
+        }
+
         LLVMContext Context;
         Context.setDiscardValueNames(LTODiscardValueNames);
         Context.enableDebugTypeODRUniquing();
-        auto ModuleIdentifier = ModuleBuffer.getBufferIdentifier();
-
-        DenseMap<GlobalValue::GUID, GlobalValue::LinkageTypes> ResolvedODR;
-        ResolveODR(*Index, ModuleToDefinedGVSummaries[ModuleIdentifier],
-                   ModuleIdentifier, ResolvedODR);
 
         // Parse module now
         auto TheModule = loadModuleFromBuffer(ModuleBuffer, Context, false);
 
         // Save temps: original file.
-        if (!SaveTempsDir.empty()) {
-          saveTempBitcode(*TheModule, SaveTempsDir, count, ".0.original.bc");
-        }
+        saveTempBitcode(*TheModule, SaveTempsDir, count, ".0.original.bc");
 
         auto &ImportList = ImportLists[ModuleIdentifier];
-        ProducedBinaries[count] = ProcessThinLTOModule(
+        // Run the main process now, and generates a binary
+        auto OutputBuffer = ProcessThinLTOModule(
             *TheModule, *Index, ModuleMap, *TMBuilder.create(), ImportList,
-            ResolvedODR, CacheOptions, DisableCodeGen, SaveTempsDir, count);
-      }, count);
-      count++;
+            ExportList, GUIDPreservedSymbols,
+            ModuleToDefinedGVSummaries[ModuleIdentifier], CacheOptions,
+            DisableCodeGen, SaveTempsDir, count);
+
+        OutputBuffer = CacheEntry.write(std::move(OutputBuffer));
+        ProducedBinaries[count] = std::move(OutputBuffer);
+      }, IndexCount);
     }
   }
+
+  CachePruning(CacheOptions.Path)
+      .setPruningInterval(CacheOptions.PruningInterval)
+      .setEntryExpiration(CacheOptions.Expiration)
+      .setMaxSize(CacheOptions.MaxPercentageOfAvailableSpace)
+      .prune();
 
   // If statistics were requested, print them out now.
   if (llvm::AreStatisticsEnabled())

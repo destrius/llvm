@@ -8,6 +8,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/Error.h"
+
+#include "llvm/ADT/Twine.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "gtest/gtest.h"
@@ -376,6 +378,20 @@ TEST(Error, CatchErrorFromHandler) {
       << "Failed to handle Error returned from handleErrors.";
 }
 
+TEST(Error, StringError) {
+  std::string Msg;
+  raw_string_ostream S(Msg);
+  logAllUnhandledErrors(make_error<StringError>("foo" + Twine(42),
+                                                inconvertibleErrorCode()),
+                        S, "");
+  EXPECT_EQ(S.str(), "foo42\n") << "Unexpected StringError log result";
+
+  auto EC =
+    errorToErrorCode(make_error<StringError>("", errc::invalid_argument));
+  EXPECT_EQ(EC, errc::invalid_argument)
+    << "Failed to convert StringError to error_code.";
+}
+
 // Test that the ExitOnError utility works as expected.
 TEST(Error, ExitOnError) {
   ExitOnError ExitOnErr;
@@ -390,6 +406,10 @@ TEST(Error, ExitOnError) {
   ExitOnErr(Error::success());
   EXPECT_EQ(ExitOnErr(Expected<int>(7)), 7)
       << "exitOnError returned an invalid value for Expected";
+
+  int A = 7;
+  int &B = ExitOnErr(Expected<int&>(A));
+  EXPECT_EQ(&A, &B) << "ExitOnError failed to propagate reference";
 
   // Exit tests.
   EXPECT_EXIT(ExitOnErr(make_error<CustomError>(7)),
@@ -407,6 +427,16 @@ TEST(Error, CheckedExpectedInSuccessMode) {
   EXPECT_TRUE(!!A) << "Expected with non-error value doesn't convert to 'true'";
   // Access is safe in second test, since we checked the error in the first.
   EXPECT_EQ(*A, 7) << "Incorrect Expected non-error value";
+}
+
+// Test Expected with reference type.
+TEST(Error, ExpectedWithReferenceType) {
+  int A = 7;
+  Expected<int&> B = A;
+  // 'Check' B.
+  (void)!!B;
+  int &C = *B;
+  EXPECT_EQ(&A, &C) << "Expected failed to propagate reference";
 }
 
 // Test Unchecked Expected<T> in success mode.
@@ -528,6 +558,25 @@ TEST(Error, ErrorCodeConversions) {
       << "ErrorOr<T> failure value should round-trip via Expected<T> "
          "conversions.";
   }
+}
+
+// Test that error messages work.
+TEST(Error, ErrorMessage) {
+  EXPECT_EQ(toString(Error::success()).compare(""), 0);
+
+  Error E1 = make_error<CustomError>(0);
+  EXPECT_EQ(toString(std::move(E1)).compare("CustomError { 0}"), 0);
+
+  Error E2 = make_error<CustomError>(0);
+  handleAllErrors(std::move(E2), [](const CustomError &CE) {
+    EXPECT_EQ(CE.message().compare("CustomError { 0}"), 0);
+  });
+
+  Error E3 = joinErrors(make_error<CustomError>(0), make_error<CustomError>(1));
+  EXPECT_EQ(toString(std::move(E3))
+                .compare("CustomError { 0}\n"
+                         "CustomError { 1}"),
+            0);
 }
 
 } // end anon namespace

@@ -102,6 +102,9 @@ HexagonCFGOptimizer::InvertAndChangeJumpTarget(MachineInstr* MI,
 
 
 bool HexagonCFGOptimizer::runOnMachineFunction(MachineFunction &Fn) {
+  if (skipFunction(*Fn.getFunction()))
+    return false;
+
   // Loop over all of the basic blocks.
   for (MachineFunction::iterator MBBb = Fn.begin(), MBBe = Fn.end();
        MBBb != MBBe; ++MBBb) {
@@ -177,6 +180,7 @@ bool HexagonCFGOptimizer::runOnMachineFunction(MachineFunction &Fn) {
           // Ensure that BB2 has one instruction -- an unconditional jump.
           if ((LayoutSucc->size() == 1) &&
               IsUnconditionalJump(LayoutSucc->front().getOpcode())) {
+            assert(JumpAroundTarget && "jump target is needed to process second basic block");
             MachineBasicBlock* UncondTarget =
               LayoutSucc->front().getOperand(0).getMBB();
             // Check if the layout successor of BB2 is BB3.
@@ -235,15 +239,8 @@ bool HexagonCFGOptimizer::runOnMachineFunction(MachineFunction &Fn) {
 //                         Public Constructor Functions
 //===----------------------------------------------------------------------===//
 
-static void initializePassOnce(PassRegistry &Registry) {
-  PassInfo *PI = new PassInfo("Hexagon CFG Optimizer", "hexagon-cfg",
-                              &HexagonCFGOptimizer::ID, nullptr, false, false);
-  Registry.registerPass(*PI, true);
-}
-
-void llvm::initializeHexagonCFGOptimizerPass(PassRegistry &Registry) {
-  CALL_ONCE_INITIALIZATION(initializePassOnce)
-}
+INITIALIZE_PASS(HexagonCFGOptimizer, "hexagon-cfg", "Hexagon CFG Optimizer",
+                false, false)
 
 FunctionPass *llvm::createHexagonCFGOptimizer() {
   return new HexagonCFGOptimizer();

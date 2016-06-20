@@ -53,6 +53,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BuildLibCalls.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 using namespace llvm;
@@ -158,8 +159,7 @@ static void deleteDeadInstruction(Instruction *I,
   SmallVector<Value *, 16> Operands(I->value_op_begin(), I->value_op_end());
   I->replaceAllUsesWith(UndefValue::get(I->getType()));
   I->eraseFromParent();
-  for (Value *Op : Operands)
-    RecursivelyDeleteTriviallyDeadInstructions(Op, TLI);
+  RecursivelyDeleteTriviallyDeadInstructions(I, TLI);
 }
 
 //===----------------------------------------------------------------------===//
@@ -169,7 +169,7 @@ static void deleteDeadInstruction(Instruction *I,
 //===----------------------------------------------------------------------===//
 
 bool LoopIdiomRecognize::runOnLoop(Loop *L, LPPassManager &LPM) {
-  if (skipOptnoneFunction(L))
+  if (skipLoop(L))
     return false;
 
   CurLoop = L;
@@ -606,7 +606,7 @@ bool LoopIdiomRecognize::processLoopMemSet(MemSetInst *MSI,
     return false;
 
   // If we're not allowed to hack on memset, we fail.
-  if (!TLI->has(LibFunc::memset))
+  if (!HasMemset)
     return false;
 
   Value *Pointer = MSI->getDest();
@@ -769,13 +769,14 @@ bool LoopIdiomRecognize::processLoopStridedStore(
     Value *MSP =
         M->getOrInsertFunction("memset_pattern16", Builder.getVoidTy(),
                                Int8PtrTy, Int8PtrTy, IntPtr, (void *)nullptr);
+    inferLibFuncAttributes(*M->getFunction("memset_pattern16"), *TLI);
 
     // Otherwise we should form a memset_pattern16.  PatternValue is known to be
     // an constant array of 16-bytes.  Plop the value into a mergable global.
     GlobalVariable *GV = new GlobalVariable(*M, PatternValue->getType(), true,
                                             GlobalValue::PrivateLinkage,
                                             PatternValue, ".memset_pattern");
-    GV->setUnnamedAddr(true); // Ok to merge these.
+    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global); // Ok to merge these.
     GV->setAlignment(16);
     Value *PatternPtr = ConstantExpr::getBitCast(GV, Int8PtrTy);
     NewCall = Builder.CreateCall(MSP, {BasePtr, PatternPtr, NumBytes});
@@ -1121,7 +1122,7 @@ bool LoopIdiomRecognize::recognizePopcount() {
 }
 
 static CallInst *createPopcntIntrinsic(IRBuilder<> &IRBuilder, Value *Val,
-                                       DebugLoc DL) {
+                                       const DebugLoc &DL) {
   Value *Ops[] = {Val};
   Type *Tys[] = {Val->getType()};
 

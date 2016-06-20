@@ -62,6 +62,9 @@ class SIMachineFunctionInfo final : public AMDGPUMachineFunction {
 
   unsigned MaximumWorkGroupSize;
 
+  // Number of reserved VGPRs for debugger usage.
+  unsigned DebuggerReservedVGPRCount;
+
 public:
   // FIXME: Make private
   unsigned LDSWaveSpillSize;
@@ -270,6 +273,10 @@ public:
     ScratchWaveOffsetReg = Reg;
   }
 
+  unsigned getQueuePtrUserSGPR() const {
+    return QueuePtrUserSGPR;
+  }
+
   bool hasSpilledSGPRs() const {
     return HasSpilledSGPRs;
   }
@@ -320,6 +327,11 @@ public:
 
   void setIfReturnsVoid(bool Value) {
     ReturnsVoid = Value;
+  }
+
+  /// \returns Number of reserved VGPRs for debugger usage.
+  unsigned getDebuggerReservedVGPRCount() const {
+    return DebuggerReservedVGPRCount;
   }
 
   unsigned getMaximumWorkGroupSize(const MachineFunction &MF) const;

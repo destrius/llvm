@@ -961,7 +961,7 @@ let test_builder () =
   group "function attribute";
   begin
       ignore (add_function_attr fn Attribute.UWTable);
-      (* CHECK: X7{{.*}}#0
+      (* CHECK: X7{{.*}}#0{{.*}}personality{{.*}}@__gxx_personality_v0
        * #0 is uwtable, defined at EOF.
        *)
       insist ([Attribute.UWTable] = function_attr fn);
@@ -1122,7 +1122,6 @@ let test_builder () =
 
     insist ((has_metadata i) = true);
     insist ((metadata i kind) = Some md);
-    insist ((get_mdnode_operands md) = [| m1; m2 |]);
 
     clear_metadata i kind;
 
@@ -1142,30 +1141,6 @@ let test_builder () =
 
     insist ((get_named_metadata m "llvm.module.flags") = [| md |])
   end;
-
-  (* Commenting this out as the debugging metadata now requires the use
-     of specialised metadata nodes, which can't currently be created via
-     the OCaml bindings. *)
-  (* group "dbg"; begin *)
-  (*   (\* DISABLED_CHECK: %dbg = add i32 %P1, %P2, !dbg !2 *)
-  (*    * !2 is metadata emitted at EOF. *)
-  (*    *\) *)
-  (*   insist ((current_debug_location atentry) = Some (mdnode context [||])); *)
-
-  (*   let m_line = const_int i32_type 2 in *)
-  (*   let m_col = const_int i32_type 3 in *)
-  (*   let m_scope = mdnode context [| |] in *)
-  (*   let m_inlined = mdnode context [| |] in *)
-  (*   let md = mdnode context [| m_line; m_col; m_scope; m_inlined |] in *)
-  (*   set_current_debug_location atentry md; *)
-
-  (*   insist ((current_debug_location atentry) = Some md); *)
-
-  (*   let i = build_add p1 p2 "dbg" atentry in *)
-  (*   insist ((has_metadata i) = true); *)
-
-  (*   clear_current_debug_location atentry *)
-  (* end; *)
 
   group "ret"; begin
     (* CHECK: ret{{.*}}P1
@@ -1195,9 +1170,7 @@ let test_builder () =
            add_clause lp (const_array ety [| ztipkc; ztid |]);
            ignore (build_resume lp (builder_at_end context bblpad));
       end;
-      (* Note: Checks below no longer check if personality function is set
-         correctly, due to changes in disassembly. *)
-      (* CHECK: landingpad{{.*}}
+      (* CHECK: landingpad
        * CHECK: cleanup
        * CHECK: catch{{.*}}i8**{{.*}}@_ZTIc
        * CHECK: filter{{.*}}@_ZTIPKc{{.*}}@_ZTId
@@ -1451,7 +1424,6 @@ let test_builder () =
  * CHECK: !llvm.module.flags = !{!0}
  * CHECK: !0 = !{i32 1, !"Debug Info Version", i32 3}
  * CHECK: !1 = !{i32 1, !"metadata test"}
- * DISABLED_CHECK: !2 = !DILocation(line: 2, column: 3, scope: !3, inlinedAt: !3)
  *)
 
 (*===-- Pass Managers -----------------------------------------------------===*)

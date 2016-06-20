@@ -244,11 +244,11 @@ bool SparcInstrInfo::AnalyzeBranch(MachineBasicBlock &MBB,
   return true;
 }
 
-unsigned
-SparcInstrInfo::InsertBranch(MachineBasicBlock &MBB,MachineBasicBlock *TBB,
-                             MachineBasicBlock *FBB,
-                             ArrayRef<MachineOperand> Cond,
-                             DebugLoc DL) const {
+unsigned SparcInstrInfo::InsertBranch(MachineBasicBlock &MBB,
+                                      MachineBasicBlock *TBB,
+                                      MachineBasicBlock *FBB,
+                                      ArrayRef<MachineOperand> Cond,
+                                      const DebugLoc &DL) const {
   assert(TBB && "InsertBranch must not be told to insert a fallthrough");
   assert((Cond.size() == 1 || Cond.size() == 0) &&
          "Sparc branch conditions should have one component!");
@@ -304,9 +304,9 @@ bool SparcInstrInfo::ReverseBranchCondition(
 }
 
 void SparcInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
-                                 MachineBasicBlock::iterator I, DebugLoc DL,
-                                 unsigned DestReg, unsigned SrcReg,
-                                 bool KillSrc) const {
+                                 MachineBasicBlock::iterator I,
+                                 const DebugLoc &DL, unsigned DestReg,
+                                 unsigned SrcReg, bool KillSrc) const {
   unsigned numSubRegs = 0;
   unsigned movOpc     = 0;
   const unsigned *subRegIdx = nullptr;
@@ -490,4 +490,20 @@ unsigned SparcInstrInfo::getGlobalBaseReg(MachineFunction *MF) const
   BuildMI(FirstMBB, MBBI, dl, get(SP::GETPCX), GlobalBaseReg);
   SparcFI->setGlobalBaseReg(GlobalBaseReg);
   return GlobalBaseReg;
+}
+
+bool SparcInstrInfo::expandPostRAPseudo(MachineBasicBlock::iterator MI) const {
+  switch (MI->getOpcode()) {
+  case TargetOpcode::LOAD_STACK_GUARD: {
+    assert(Subtarget.isTargetLinux() &&
+           "Only Linux target is expected to contain LOAD_STACK_GUARD");
+    // offsetof(tcbhead_t, stack_guard) from sysdeps/sparc/nptl/tls.h in glibc.
+    const int64_t Offset = Subtarget.is64Bit() ? 0x28 : 0x14;
+    MI->setDesc(get(Subtarget.is64Bit() ? SP::LDXri : SP::LDri));
+    MachineInstrBuilder(*MI->getParent()->getParent(), MI)
+        .addReg(SP::G7).addImm(Offset);
+    return true;
+  }
+  }
+  return false;
 }

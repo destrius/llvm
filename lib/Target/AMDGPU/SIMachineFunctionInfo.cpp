@@ -49,6 +49,7 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
     PSInputAddr(0),
     ReturnsVoid(true),
     MaximumWorkGroupSize(0),
+    DebuggerReservedVGPRCount(0),
     LDSWaveSpillSize(0),
     PSInputEna(0),
     NumUserSGPRs(0),
@@ -116,6 +117,9 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
 
     if (F->hasFnAttribute("amdgpu-dispatch-ptr"))
       DispatchPtr = true;
+
+    if (F->hasFnAttribute("amdgpu-queue-ptr"))
+      QueuePtr = true;
   }
 
   // We don't need to worry about accessing spills with flat instructions.
@@ -129,6 +133,9 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
     MaximumWorkGroupSize = AMDGPU::getMaximumWorkGroupSize(*F);
   else
     MaximumWorkGroupSize = ST.getWavefrontSize();
+
+  if (ST.debuggerReserveRegs())
+    DebuggerReservedVGPRCount = 4;
 }
 
 unsigned SIMachineFunctionInfo::addPrivateSegmentBuffer(

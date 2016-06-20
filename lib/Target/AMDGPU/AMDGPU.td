@@ -325,7 +325,14 @@ def FeatureDebuggerInsertNops : SubtargetFeature<
   "amdgpu-debugger-insert-nops",
   "DebuggerInsertNops",
   "true",
-  "Insert two nop instructions for each high level source statement"
+  "Insert one nop instruction for each high level source statement"
+>;
+
+def FeatureDebuggerReserveRegs : SubtargetFeature<
+  "amdgpu-debugger-reserve-regs",
+  "DebuggerReserveRegs",
+  "true",
+  "Reserve registers for debugger usage"
 >;
 
 //===----------------------------------------------------------------------===//
